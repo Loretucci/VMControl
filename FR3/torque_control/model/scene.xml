@@ -31,6 +31,13 @@
       <!-- With no pos attribute, the site is located at the carriage origin. -->
       <site name = "reference_site_mobile" type = "sphere" size = "0.03" rgba = "1 0 0 1"/>
     </body>
+    <body name= "virtual_mass_z" pos="0.5545 0 0.3245" gravcomp="1">
+      <!-- Positive joint displacement moves the carriage toward world -x. -->
+      <joint name = "rail_joint_z" type = "slide" axis = "0 0 1" limited = "true" range = "0 0.55"/>
+      <inertial mass = "0.1" pos = "0 0 0" diaginertia ="0.001 0.001 0.001"/>
+      <!-- Default site position is 0 0 0 in this body's local frame. -->
+      <site name = "reference_site_mobile_z" type = "sphere" size = "0.03" rgba = " 0 0.5 1 1"/>
+    </body>   
   </worldbody>
           
 </mujoco>
