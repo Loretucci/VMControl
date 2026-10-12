@@ -1,4 +1,5 @@
 <mujoco model="fr3 scene">
+  <!-- Simulated plant: the seven FR3 joints receive motor torques from Python. -->
   <include file="fr3.xml"/>
 
   <visual>
@@ -17,12 +18,17 @@
   <worldbody>
     <light pos="0 0 1.5" dir="0 0 -1" directional="true"/>
     <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"/>
+    <!-- Older fixed reference marker; the mobile-rail controller does not use it. -->
     <site name = "reference_site" pos = "0.7 0 0.3" type = "sphere" size = "0.03" rgba = "1 0 0 1"/>
   
 
-    <body name= "virtual_mass" pos="0 0 1.5">
-      <joint name = "rail_joint" type = "slide" axis = "1 0 0" limited = "true" range = "0 3"/>
+    <!-- Visible copy of the virtual carriage. Python replaces this joint's
+         position and speed with the values from scene_virtual.xml each step. -->
+    <body name= "virtual_mass" pos="0.5545 0 0.6245">
+      <!-- s=0 places the site at the body origin; s=0.5 moves it 0.5 m in -x. -->
+      <joint name = "rail_joint" type = "slide" axis = "-1 0 0" limited = "true" range = "0 0.5"/>
       <inertial mass = "1" pos = "0 0 0" diaginertia ="0.001 0.001 0.001"/>
+      <!-- With no pos attribute, the site is located at the carriage origin. -->
       <site name = "reference_site_mobile" type = "sphere" size = "0.03" rgba = "1 0 0 1"/>
     </body>
   </worldbody>

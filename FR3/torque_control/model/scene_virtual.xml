@@ -1,4 +1,6 @@
 <mujoco model="fr3 scene">
+  <!-- Computational copy of the FR3. Python synchronizes its joint state to
+       the simulated plant before evaluating the virtual spring forces. -->
   <include file="fr3_virtual.xml"/>
 
   <visual>
@@ -17,19 +19,28 @@
   <worldbody>
     <light pos="0 0 1.5" dir="0 0 -1" directional="true"/>
     <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"/>
+    <!-- Older fixed reference marker; not used by the mobile-rail actuators. -->
     <site name = "reference_site" pos = "0.7 0 0.3" type = "sphere" size = "0.03" rgba = "1 0 0 1"/>
   
 
-    <body name= "virtual_mass" pos="0 0 1.5">
-      <joint name = "rail_joint" type = "slide" axis = "1 0 0" limited = "true" range = "0 3"/>
-      <inertial mass = "1" pos = "0 0 0" diaginertia ="0.001 0.001 0.001"/>
+    <!-- This carriage is dynamic: its state is preserved across mj_step calls.
+         Its site is the moving Cartesian reference for the virtual FR3. -->
+    <body name= "virtual_mass" pos="0.5545 0 0.6245">
+      <!-- Positive joint displacement moves the carriage toward world -x. -->
+      <joint name = "rail_joint" type = "slide" axis = "-1 0 0" limited = "true" range = "0 0.5"/>
+      <inertial mass = "0.1" pos = "0 0 0" diaginertia ="0.001 0.001 0.001"/>
+      <!-- Default site position is 0 0 0 in this body's local frame. -->
       <site name = "reference_site_mobile" type = "sphere" size = "0.03" rgba = "1 0 0 1"/>
     </body> 
   </worldbody>
+  <!-- Each position actuator connects the end effector to the moving site in
+       one Cartesian direction. With ctrl=0, kp and kv generate spring and
+       damping forces from relative position and velocity. MuJoCo maps them to
+       generalized forces; Python reads the FR3 entries from qfrc_actuator. -->
   <actuator>
-    <position name = "x_spring" site = "attachment_site" refsite = "reference_site_mobile" gear = "1 0 0 0 0 0" kp = "100" kv = "20"/> 
-    <position name = "y_spring" site = "attachment_site" refsite = "reference_site_mobile" gear = "0 1 0 0 0 0" kp = "100" kv = "20"/>
-    <position name = "z_spring" site = "attachment_site" refsite = "reference_site_mobile" gear = "0 0 1 0 0 0" kp = "100" kv = "20"/>
+    <position name = "x_spring" site = "attachment_site" refsite = "reference_site_mobile" gear = "1 0 0 0 0 0" kp = "2000" kv = "30"/>
+    <position name = "y_spring" site = "attachment_site" refsite = "reference_site_mobile" gear = "0 1 0 0 0 0" kp = "2000" kv = "30"/>
+    <position name = "z_spring" site = "attachment_site" refsite = "reference_site_mobile" gear = "0 0 1 0 0 0" kp = "2000" kv = "30"/>
   </actuator>
           
 </mujoco>
