@@ -1,0 +1,47 @@
+<mujoco model = "single_pendulum">
+
+    <visual>
+        <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0"/>
+        <rgba haze="0.15 0.25 0.35 1"/>
+        <global azimuth="120" elevation="-20"/>
+    </visual>
+
+    <worldbody>
+        <geom name = "floor" type = "plane" size ="1 1 0.1" rgba = ".9 0 0 1" />
+        <body name = "bar"
+            pos =  "0 0 2"> <!--Position of body ref frame wrt worldbody-->
+
+            <joint name ="hinge"
+                type ="hinge"
+                axis ="0 1 0"
+                damping = "0.05"/>
+
+            <geom name ="bar"
+                type = "cylinder"
+                pos = "0 0 -0.5"
+                size = "0.03 0.5"
+                rgba = ".5 .2 .6 1"
+                mass = "1"/> <!--pos is the center of mass wrt body RF, size is ray and halflength-->
+        
+            <site name = "tip"
+                pos = "0 0 -1"
+                size = "0.04"
+                rgba = "0 1 0 1" /> <!-- size, rgba just for viewing purposes-->
+
+        </body>
+
+
+
+    </worldbody>
+    <actuator>
+        <position name = "pendulum_hinge"
+            joint = "hinge"
+            kp = "20"
+            kv = "5" />
+        <motor name = "gravity comp"
+            joint = "hinge"
+            gear = "1" />
+
+    </actuator>
+
+</mujoco>
