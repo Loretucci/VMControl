@@ -33,3 +33,11 @@ This package contains a simplified robot description (MJCF) of the [Franka Resea
 ## License
 
 This model is released under an [Apache-2.0 License](LICENSE).
+
+
+## Terminal use
+
+cd "/Users/lorenzotucci/Desktop/Progetto Tesi"
+source .venv/bin/activate
+cd "MuJoCo Projects/FR3"
+mjpython name_file.py
