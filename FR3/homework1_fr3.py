@@ -18,7 +18,7 @@ scene_path = (
     / "FR3"
     / "torque_control"
     / "model"
-    / "scene.xml"
+    / "scene1.xml"
 )
 
 # MjModel stores the compiled robot description. MjData stores the current
@@ -61,7 +61,7 @@ mujoco.mj_forward(model, data)
 # 4. Experiment parameters
 # -----------------------------------------------------------------------------
 # Cartesian PID gains.
-kp = 100
+kp = 300
 kv = 20
 ki = 5
 

@@ -164,6 +164,5 @@
 
   <keyframe>
     <key name="home" qpos="0 0 0 -1.57079 0 1.57079 -0.7853" ctrl="0 0 0 0 0 0 0"/>
-    <key name="home_fake" qpos="0.5 0.5 0 -1.57079 0 1.57079 -0.7853" ctrl="0 0 0 0 0 0 0"/>
   </keyframe>
 </mujoco>

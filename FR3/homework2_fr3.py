@@ -21,7 +21,7 @@ scene_path_real = (
     / "FR3"
     / "torque_control"
     / "model"
-    / "scene.xml"
+    / "scene1.xml"
 )
 scene_path_virt = (
     project_root
@@ -29,7 +29,7 @@ scene_path_virt = (
     / "FR3"
     / "torque_control"
     / "model"
-    / "scene_virtual.xml"
+    / "scene_virtual_fixed.xml"
 )
 # MjModel stores the compiled robot description. MjData stores the current
 # simulation state and all quantities computed from it.
@@ -69,7 +69,7 @@ reference_site_id = mujoco.mj_name2id(
 mujoco.mj_resetDataKeyframe(model_real, data_real, home_id)
 mujoco.mj_forward(model_real, data_real)
 
-# Record the end-effector position, reference, and error for 10 simulated seconds.
+# Record the end-effector position, reference, and error for 20 simulated seconds.
 error_times = []
 error_vectors = []
 attachment_positions = []
