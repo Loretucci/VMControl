@@ -116,7 +116,7 @@ mujoco.mj_forward(model_real, data_real)
 # All positions are in the world frame and all errors use
 #     error = mobile_reference_position - real_end_effector_position.
 # A negative x error therefore means the reference is farther toward -x.
-plot_path = Path(__file__).resolve().parent / "Plots" / "error_rail.png"
+plot_path = Path(__file__).resolve().parent / "Plots" / "error_rail_x.png"
 error_times = []
 error_vectors = []
 attachment_positions = []
