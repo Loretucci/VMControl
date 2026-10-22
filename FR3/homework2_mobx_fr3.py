@@ -244,7 +244,7 @@ with mujoco.viewer.launch_passive(model_real, data_real) as viewer:
         # qfrc_applied is indexed by DoF. Because this slide's axis is -x,
         # +20 N in its generalized coordinate pushes the carriage toward -x.
         # Set it every cycle so the post-limit value remains explicitly zero.
-        data_virt.qfrc_applied[rail_dof_id_virt] = 20.0 if rail_force_active else 0.0
+        data_virt.qfrc_applied[rail_dof_id_virt] = 5.0 if rail_force_active else 0.0
 
         # qfrc_actuator is a vector of generalized forces for all eight virtual
         # DoFs. Its first seven entries are the spring-generated joint torques;
