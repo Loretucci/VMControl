@@ -100,7 +100,7 @@ def main():
         parser.error("state-timeout must be positive")
 
     # Fixed desired location of the custom tool tip, in world coordinates.
-    reference_position = (0.7, 0.0, 0.3)
+    reference_position = (0.4, 0.0, 0.1)
 
     # scene1.xml includes fr3.xml, so this single specification contains both
     # the robot and the world. The custom sites are added before compilation.
