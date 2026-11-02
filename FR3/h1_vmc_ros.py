@@ -11,17 +11,21 @@ import time
 
 import mujoco
 from mujoco import viewer
+from geometry_msgs.msg import PoseStamped
 import numpy as np
 import math
+from threading import Lock
 
 from mujoco_vmc import (
     LinearDamper,
     MuJoCoSite,
+    ObjectState,
     RobotROSBridge,
     RobotStateSynchronizer,
     TanhSpring,
     VirtualConnection,
     VirtualMechanism,
+    StaticObject,
 )
 
 def build_ee_link_model(
@@ -64,7 +68,8 @@ def build_ee_link_model(
     ee_spec.add_site(name="gripper_left_finger", pos=[x_l, y_l, 0.107 + L], size=[0.012, 0.0, 0.0], rgba=[1.0, 0.2, 0.2, 0.8]) 
     ee_spec.add_site(name="gripper_right_finger", pos=[x_r, y_r, 0.107 + L], size=[0.012, 0.0, 0.0], rgba=[1.0, 0.2, 0.2, 0.8])
 
-def build_ref_site(spec, pos_x, pos_y, pos_z,link_length):
+
+def build_ref_objects(pos_x, pos_y, pos_z,link_length):
     """Create three stationary world-frame targets for the virtual tool sites.
 
     ``(pos_x, pos_y, pos_z)`` is the desired tip position in the MuJoCo world.
@@ -73,11 +78,30 @@ def build_ref_site(spec, pos_x, pos_y, pos_z,link_length):
     the attachment site lies ``L`` above the tip.
     """
     L = float(link_length)
+    cur_ee_rot = np.eye(3)
+    target_att_pos = np.array([pos_x, pos_y, pos_z+L])
+    target_l_pos = np.array([pos_x + 0.3, pos_y, pos_z])
+    target_r_pos = np.array([pos_x - 0.3, pos_y, pos_z])
+    
+
     # At the desired tool orientation, the attachment is L above the tip and
     # the two finger targets lie at +x/-x in world coordinates.
-    spec.worldbody.add_site(name = "target_attachment_site", pos = [pos_x, pos_y, pos_z + L], size = [0.02])
-    spec.worldbody.add_site(name ="target_left_finger", pos = [pos_x + 0.3, pos_y , pos_z], size = [0.02])
-    spec.worldbody.add_site(name = "target_right_finger", pos = [pos_x - 0.3, pos_y , pos_z], size = [0.02])
+    target_att = StaticObject(ObjectState(position=target_att_pos, rotation=cur_ee_rot, linear_velocity=np.zeros(3)),name = "target_attachment_site")
+    target_l = StaticObject(ObjectState(position=target_l_pos, rotation=cur_ee_rot,linear_velocity=np.zeros(3)),name ="target_left_finger")
+    target_r = StaticObject(ObjectState(position=target_r_pos, rotation=cur_ee_rot,linear_velocity=np.zeros(3)),name = "target_right_finger")
+    return target_att,target_l, target_r
+
+
+def orientation_from_points(attachment, left, right):
+    """Build a world-frame orientation from the virtual finger and tool axes."""
+    x_axis = np.asarray(left, dtype=float) - right
+    x_axis /= np.linalg.norm(x_axis)
+    z_axis = (np.asarray(left, dtype=float) + right) / 2.0 - attachment
+    z_axis -= np.dot(z_axis, x_axis) * x_axis
+    z_axis /= np.linalg.norm(z_axis)
+    y_axis = np.cross(z_axis, x_axis)
+    return np.column_stack((x_axis, y_axis, z_axis))
+
 
 def main():
     """Build the virtual robot, receive joint states, and publish VMC torques."""
@@ -95,6 +119,7 @@ def main():
     parser.add_argument("--state-timeout", type=float, default=0.2, help="Publish zero VMC torque if no new robot state arrives for this many seconds")
     parser.add_argument("--headless", action="store_true", help="Run in headless mode without passive viewer")
     parser.add_argument("--duration", type=float, default=60.0, help="Run duration in seconds if headless (<= 0 runs indefinitely)")
+    parser.add_argument("--camera-topic", type = str, default = "/vision/aruco_pose", help="Topic on which receiving ArUco pose")
     #parser.add_argument("--scene", type = str, default = "mujoco/")
     args = parser.parse_args()
     if args.state_timeout <= 0:
@@ -112,7 +137,7 @@ def main():
 
     spec = mujoco.MjSpec.from_file(str(scene_xml))
     build_ee_link_model(spec, args.link_length)
-    build_ref_site(spec, *reference_position, args.link_length)
+    target_att, target_left, target_right = build_ref_objects(*reference_position, args.link_length)
     model = spec.compile()
     # The model stores geometry/parameters; MjData stores its current state and
     # computed quantities. This timestep only paces our Python loop below.
@@ -128,7 +153,38 @@ def main():
         pub_torque_topic=args.torque_pub_topic,
         pub_rate_hz=args.pub_rate,
     )
+
     bridge.start()
+    camera_lock = Lock()
+    latest_camera_pose = None
+
+    def on_aruco_pose(msg: PoseStamped):
+        nonlocal latest_camera_pose
+
+        if msg.header.frame_id != "base":
+            return
+
+        p = np.array([
+            msg.pose.position.x,
+            msg.pose.position.y,
+            msg.pose.position.z,
+        ], dtype=float)
+
+        q = np.array([
+            msg.pose.orientation.w,
+            msg.pose.orientation.x,
+            msg.pose.orientation.y,
+            msg.pose.orientation.z,
+        ], dtype=float)
+
+        norm = np.linalg.norm(q)
+        if not np.all(np.isfinite(p)) or not np.all(np.isfinite(q)) or norm < 1e-6:
+            return
+
+        with camera_lock:
+            latest_camera_pose = (p, q / norm, time.perf_counter())
+
+    camera_sub = bridge.node.create_subscription(PoseStamped, args.camera_topic, on_aruco_pose, 1)
 
     # Wait for the first measured pose before evaluating any virtual spring.
     # Mock mode supplies one pose for debugging; it does not generate a stream.
@@ -154,25 +210,17 @@ def main():
     # Subsequent messages update both arrays via apply_incoming_state().
     sync.set_state(data, initial_qpos, initial_qvel, forward=True)
 
-    # The tip and original reference are used to print a simple xyz error.
-    # The three point pairs below are what actually generate virtual forces.
+    # The tool tip and three point pairs are used for control diagnostics.
     tip_id = model.site("ee_link_tip").id
-    reference_id = model.site("reference_site").id
 
     att_site_id = model.site("attachment_site").id
     left_grip_id = model.site("gripper_left_finger").id
     right_grip_id = model.site("gripper_right_finger").id
-    target_id = model.site("target_attachment_site").id
-    left_target_id = model.site("target_left_finger").id
-    right_target_id = model.site("target_right_finger").id
     # MuJoCoSite wraps a site so the VMC library can read its world position,
     # linear velocity, and force-to-joint mapping from the current MjData.
     r_att_site = MuJoCoSite(att_site_id, "att_site")
     r_left_site = MuJoCoSite(left_grip_id, "left_finger")
     r_right_site = MuJoCoSite(right_grip_id, "right_finger")
-    target_att_site = MuJoCoSite(target_id, "att_target")
-    target_left_site = MuJoCoSite(left_target_id, "left_target")
-    target_right_site = MuJoCoSite(right_target_id, "right_target")
 
     # Each connection pulls a robot site toward its fixed target with a
     # saturating spring and opposes relative velocity with a linear damper.
@@ -181,7 +229,7 @@ def main():
     # by that spring parameter either.
     conn_att = VirtualConnection(
         source=r_att_site,
-        target=target_att_site,
+        target=target_att,
         components=[
             TanhSpring(args.stiffness, max_force=args.max_force),
             LinearDamper(args.damping),
@@ -190,7 +238,7 @@ def main():
     )
     conn_left = VirtualConnection(
         source=r_left_site,
-        target=target_left_site,
+        target=target_left,
         components=[
             TanhSpring(args.stiffness, max_force=args.max_force),
             LinearDamper(args.damping),
@@ -199,7 +247,7 @@ def main():
     )
     conn_right = VirtualConnection(
         source=r_right_site,
-        target=target_right_site,
+        target=target_right,
         components=[
             TanhSpring(args.stiffness, max_force=args.max_force),
             LinearDamper(args.damping),
@@ -224,26 +272,64 @@ def main():
         dq. ``mechanism.apply`` computes generalized forces from the virtual
         components at that measured state.
         """
-        nonlocal last_telemetry_log, last_state_time, state_timeout_logged
+        nonlocal last_telemetry_log, last_state_time, state_timeout_logged, latest_camera_pose
         # Consume the most recent JointState, if any. With forward=True, the
         # synchronizer calls mj_forward to refresh site poses and velocities.
         state_updated = bridge.apply_incoming_state(data, forward=True)
+        with camera_lock:
+            camera_pose = latest_camera_pose
+            latest_camera_pose = None
+        
+        if camera_pose is not None:
+            p_marker, q_marker, received_at = camera_pose
+
+            rotation_flat = np.empty(9)
+            mujoco.mju_quat2Mat(rotation_flat, q_marker)  # q_marker è [w, x, y, z]
+            R_base_aruco = rotation_flat.reshape(3, 3)
+
+            x_aruco_in_base = R_base_aruco[:, 0]
+            z_aruco = R_base_aruco[:, 2]
+
+            p_target = p_marker - h * z_aruco
+            p_left = p_target + 0.30 * x_aruco_in_base
+            p_right = p_target - 0.30 * x_aruco_in_base
+            p_att   = p_target - args.link_length * z_aruco
+
+            target_left.set_state(ObjectState(position=p_left, linear_velocity=np.zeros(3)))
+            target_right.set_state(ObjectState(position=p_right, linear_velocity=np.zeros(3)))
+            target_att.set_state(ObjectState(position=p_att, linear_velocity=np.zeros(3)))
+
         if state_updated:
             last_state_time = time.perf_counter()
             state_timeout_logged = False
 
-        # site_xpos is expressed in the MuJoCo world frame. This diagnostic
-        # error compares the desired and measured custom-tool tip positions.
-        error_xyz = data.site_xpos[reference_id] - data.site_xpos[tip_id]
         if state_updated and (time.time() - last_telemetry_log > 1.0):
+            # The active StaticObjects are the source of truth for both errors.
+            target_att_pos = target_att.state(model, data).position
+            target_left_pos = target_left.state(model, data).position
+            target_right_pos = target_right.state(model, data).position
+            desired_tip_pos = (target_left_pos + target_right_pos) / 2.0
+            error_xyz = desired_tip_pos - data.site_xpos[tip_id]
+
+            target_rotation = orientation_from_points(target_att_pos, target_left_pos, target_right_pos)
+            measured_rotation = orientation_from_points(
+                data.site_xpos[att_site_id],
+                data.site_xpos[left_grip_id],
+                data.site_xpos[right_grip_id],
+            )
+            relative_rotation = target_rotation @ measured_rotation.T
+            cosine = np.clip((np.trace(relative_rotation) - 1.0) / 2.0, -1.0, 1.0)
+            orientation_error_deg = np.degrees(np.arccos(cosine))
+
             connection_errors = [
-                np.linalg.norm(data.site_xpos[target_id] - data.site_xpos[att_site_id]),
-                np.linalg.norm(data.site_xpos[left_target_id] - data.site_xpos[left_grip_id]),
-                np.linalg.norm(data.site_xpos[right_target_id] - data.site_xpos[right_grip_id]),
+                np.linalg.norm(target_att_pos - data.site_xpos[att_site_id]),
+                np.linalg.norm(target_left_pos - data.site_xpos[left_grip_id]),
+                np.linalg.norm(target_right_pos - data.site_xpos[right_grip_id]),
             ]
             print(
                 f"Errore punta xyz: {np.round(error_xyz, 4)} m; "
                 f"modulo: {np.linalg.norm(error_xyz):.4f} m; "
+                f"orientazione: {orientation_error_deg:.2f}°; "
                 f"massimo sui 3 collegamenti: {max(connection_errors):.4f} m"
             )
             last_telemetry_log = time.time()
@@ -270,59 +356,39 @@ def main():
         # value at --pub-rate; this call does not directly publish a message.
         bridge.publish(data, torques=required_torques) 
     
-   # 6. Execution Loop
-    if args.headless:
-        t_start = time.perf_counter()
-        sim_time = 0.0
-        try:
-            while args.duration <= 0 or sim_time < args.duration:
-                if args.update_state and bridge is not None:
-                    q, dq = bridge.wait_for_new_state(timeout=0.005)
-                    if q is not None:
-                        sync.set_state(data, q, dq, forward=True)
-                        step_iteration()
-                        sim_time += dt
+    # 6. Execution loop. step_iteration() is the only reader of new ROS joint states.
+    t_start = time.perf_counter()
+    next_tick = t_start
+    try:
+        if args.headless:
+            while args.duration <= 0 or time.perf_counter() - t_start < args.duration:
+                step_iteration()
+                next_tick += dt
+                remaining = next_tick - time.perf_counter()
+                if remaining > 0:
+                    time.sleep(remaining)
                 else:
-                    wall_time = time.perf_counter() - t_start
-                    if wall_time - sim_time > 0.1:
-                        sim_time = wall_time
-                    while sim_time < wall_time and (args.duration <= 0 or sim_time < args.duration):
-                        step_iteration()
-                        sim_time += dt
-                    time.sleep(0.0002)
-        except KeyboardInterrupt:
-            print("\n[INFO] Headless simulation interrupted by user.")
-    else:
-        t_start = time.perf_counter()
-        sim_time = 0.0
-        with viewer.launch_passive(model, data) as v:
-            print("[INFO] Passive viewer active. Double-right-click and drag the robot end-effector!")
-            while v.is_running() and (args.duration <= 0 or sim_time < args.duration):
-                if args.update_state and bridge is not None:
-                    q, dq = bridge.wait_for_new_state(timeout=0.002)
-                    if q is not None:
-                        sync.set_state(data, q, dq, forward=True)
-                        step_iteration()
-                        sim_time += dt
-                else:
-                    wall_time = time.perf_counter() - t_start
-                    if wall_time - sim_time > 0.1:
-                        sim_time = wall_time
-                    while sim_time < wall_time:
-                        step_iteration()
-                        sim_time += dt
-
-                # Visualize plane and dynamic spring
-                with v.lock():
-                    v.user_scn.ngeom = 0
-                    draw_visual_plane_and_spring(
-                        v.user_scn,
-                        p_init=p_init,
-                        p_slider=data.xpos[slider_id],
-                        p_ee=data.site_xpos[att_site_id],
-                    )
-                v.sync()
-                time.sleep(0.001)
+                    next_tick = time.perf_counter()
+        else:
+            next_viewer_sync = t_start
+            with viewer.launch_passive(model, data) as v:
+                print("[INFO] Passive viewer active. Double-right-click and drag the robot end-effector!")
+                while v.is_running() and (args.duration <= 0 or time.perf_counter() - t_start < args.duration):
+                    step_iteration()
+                    now = time.perf_counter()
+                    if now >= next_viewer_sync:
+                        v.sync()
+                        next_viewer_sync = now + 1.0 / 30.0
+                    next_tick += dt
+                    remaining = next_tick - time.perf_counter()
+                    if remaining > 0:
+                        time.sleep(remaining)
+                    else:
+                        next_tick = time.perf_counter()
+    except KeyboardInterrupt:
+        print("\n[INFO] Control interrupted by user.")
+    finally:
+        bridge.stop()
 
      
 if __name__ == "__main__":
