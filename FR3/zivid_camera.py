@@ -71,7 +71,7 @@ def main():
     app = zivid.Application()
 
     camera = app.connect_camera()
-    settings = zivid.Settings.load("percorso/delle/impostazioni.yml")
+    settings = zivid.Settings.load("Scrivania/Tesi/First_Ex_LAB_VMC_OmarLibrary_27-10/zivid_camera_settings.yml")
 
     marker_id = 16
     marker_dict = zivid.calibration.MarkerDictionary.aruco5x5_1000

@@ -289,7 +289,7 @@ def main():
 
             x_aruco_in_base = R_base_aruco[:, 0]
             z_aruco = R_base_aruco[:, 2]
-
+            h = 0.0
             p_target = p_marker - h * z_aruco
             p_left = p_target + 0.30 * x_aruco_in_base
             p_right = p_target - 0.30 * x_aruco_in_base
