@@ -95,6 +95,7 @@ def main():
     parser.add_argument("--state-timeout", type=float, default=0.2, help="Publish zero VMC torque if no new robot state arrives for this many seconds")
     parser.add_argument("--headless", action="store_true", help="Run in headless mode without passive viewer")
     parser.add_argument("--duration", type=float, default=60.0, help="Run duration in seconds if headless (<= 0 runs indefinitely)")
+    #parser.add_argument("--scene", type = str, default = "mujoco/")
     args = parser.parse_args()
     if args.state_timeout <= 0:
         parser.error("state-timeout must be positive")
@@ -269,54 +270,60 @@ def main():
         # value at --pub-rate; this call does not directly publish a message.
         bridge.publish(data, torques=required_torques) 
     
-    # sim_time below counts intended controller iterations against wall time.
-    # It is not MuJoCo simulation time because this script does not call
-    # mj_step. A backlog greater than 0.1 s is skipped rather than replayed.
+   # 6. Execution Loop
     if args.headless:
         t_start = time.perf_counter()
         sim_time = 0.0
         try:
             while args.duration <= 0 or sim_time < args.duration:
-                wall_time = time.perf_counter() - t_start
-                if wall_time - sim_time > 0.1:
-                    sim_time = wall_time
-
-                # Recompute from the latest available measured state while
-                # advancing the loop's logical clock by one interval.
-                while sim_time < wall_time and (args.duration <= 0 or sim_time < args.duration):
-                    step_iteration()
-                    sim_time += dt
-
-                time.sleep(0.0002)
+                if args.update_state and bridge is not None:
+                    q, dq = bridge.wait_for_new_state(timeout=0.005)
+                    if q is not None:
+                        sync.set_state(data, q, dq, forward=True)
+                        step_iteration()
+                        sim_time += dt
+                else:
+                    wall_time = time.perf_counter() - t_start
+                    if wall_time - sim_time > 0.1:
+                        sim_time = wall_time
+                    while sim_time < wall_time and (args.duration <= 0 or sim_time < args.duration):
+                        step_iteration()
+                        sim_time += dt
+                    time.sleep(0.0002)
         except KeyboardInterrupt:
             print("\n[INFO] Headless simulation interrupted by user.")
-        print("[INFO] Headless run completed.")
     else:
         t_start = time.perf_counter()
         sim_time = 0.0
-        render_interval = 1.0 / 60.0
-        last_render = 0.0
-
-        # The viewer and VMC calculation run together in this process.
         with viewer.launch_passive(model, data) as v:
-            while v.is_running():
-                wall_time = time.perf_counter() - t_start
-
-                # Skip accumulated logical iterations after a long pause.
-                if wall_time - sim_time > 0.1:
-                    sim_time = wall_time
-
-                # Update control calculations; no physics integration occurs.
-                while sim_time < wall_time:
-                    step_iteration()
-                    sim_time += dt
-
-                # Refresh the displayed model at about 60 Hz.
-                if wall_time - last_render >= render_interval:
-                    v.sync()
-                    last_render = wall_time
+            print("[INFO] Passive viewer active. Double-right-click and drag the robot end-effector!")
+            while v.is_running() and (args.duration <= 0 or sim_time < args.duration):
+                if args.update_state and bridge is not None:
+                    q, dq = bridge.wait_for_new_state(timeout=0.002)
+                    if q is not None:
+                        sync.set_state(data, q, dq, forward=True)
+                        step_iteration()
+                        sim_time += dt
                 else:
-                    time.sleep(0.0002)
+                    wall_time = time.perf_counter() - t_start
+                    if wall_time - sim_time > 0.1:
+                        sim_time = wall_time
+                    while sim_time < wall_time:
+                        step_iteration()
+                        sim_time += dt
+
+                # Visualize plane and dynamic spring
+                with v.lock():
+                    v.user_scn.ngeom = 0
+                    draw_visual_plane_and_spring(
+                        v.user_scn,
+                        p_init=p_init,
+                        p_slider=data.xpos[slider_id],
+                        p_ee=data.site_xpos[att_site_id],
+                    )
+                v.sync()
+                time.sleep(0.001)
+
      
 if __name__ == "__main__":
     main()
