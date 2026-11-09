@@ -13,7 +13,7 @@ import mujoco
 from mujoco import viewer
 from geometry_msgs.msg import PoseStamped
 import numpy as np
-import math
+from scipy.spatial.transform import Rotation
 from threading import Lock
 
 from mujoco_vmc import (
@@ -26,57 +26,30 @@ from mujoco_vmc import (
     VirtualConnection,
     VirtualMechanism,
     StaticObject,
+    resolve_menagerie_path,
 )
 
 def build_ee_link_model(
     spec,
-    link_length: float = 0.24,
+    link_length: float = 0.4,
 ):
-    """Attach the custom tool's visualization and three control points to link 7.
-
-    All positions below are in the local frame of ``fr3_link7``. Because the
-    sites belong to that body, they follow its motion without adding joints.
-    ``link_length`` is measured from the existing attachment site, whose local
-    z coordinate is 0.107 m.
-    """
-
-    # MjSpec lets us extend the XML scene in memory before compiling MjModel.
-    ee_spec = spec.body("fr3_link7")
-
+    """Add three rigid control sites in the Robotiq base frame around the TCP."""
+    ee_spec = spec.body("robotiq_base_link")
+    tcp_site = spec.site("tcp")
+    tcp_pos = tcp_site.pos
     L = float(link_length)
-    # The two virtual finger sites are 0.30 m from the tip in the local xy
-    # plane. The 45-degree components give the requested diagonal direction.
-    x_l = 0.3 * np.cos(math.pi/4) 
-    y_l = 0.3 * np.sin(math.pi/4)
-    x_r = - x_l
-    y_r = - y_l
 
-    # The tip site defines the custom contact point. The capsule is purely
-    # visual: disabled contact flags prevent it from adding collision forces.
-    ee_spec.add_site(name="ee_link_tip", pos=[0.0, 0.0, 0.107 + L], size=[0.012, 0.0, 0.0], rgba=[1.0, 0.2, 0.2, 0.8])
-    ee_spec.add_geom(
-        type=mujoco.mjtGeom.mjGEOM_CAPSULE,
-        fromto=[0.0, 0.0, 0.107, 0.0, 0.0, 0.107 + L],
-        size=[0.007, 0.0, 0.0],
-        rgba=[0.1, 0.6, 1.0, 0.7],
-        contype=0,
-        conaffinity=0,
-    )
-
-    # Separate finger sites let three translational connections also resist
-    # changes in tool orientation through their different lever arms.
-    ee_spec.add_site(name="gripper_left_finger", pos=[x_l, y_l, 0.107 + L], size=[0.012, 0.0, 0.0], rgba=[1.0, 0.2, 0.2, 0.8]) 
-    ee_spec.add_site(name="gripper_right_finger", pos=[x_r, y_r, 0.107 + L], size=[0.012, 0.0, 0.0], rgba=[1.0, 0.2, 0.2, 0.8])
+    # The existing TCP site is the desired contact point. These three sites
+    # provide separated lever arms for the virtual connections around it.
+    # Positions passed to add_site are in robotiq_base_link coordinates:
+    # TCP +x (jaw closing direction) is robotiq_base_link -y.
+    ee_spec.add_site(name="ee_top_spring", pos=[tcp_pos[0], tcp_pos[1], tcp_pos[2] - L], size=[0.012, 0.0, 0.0], rgba=[1.0, 0.0, 0.0, 0.8], group=0)
+    ee_spec.add_site(name="gripper_left_finger", pos=[tcp_pos[0], tcp_pos[1] - 0.3, tcp_pos[2]], size=[0.012, 0.0, 0.0], rgba=[1.0, 0.0, 0.0, 0.8], group=0)
+    ee_spec.add_site(name="gripper_right_finger", pos=[tcp_pos[0], tcp_pos[1] + 0.3, tcp_pos[2]], size=[0.012, 0.0, 0.0], rgba=[1.0, 0.0, 0.0, 0.8], group=0)
 
 
 def build_ref_objects(pos_x, pos_y, pos_z,link_length):
-    """Create three stationary world-frame targets for the virtual tool sites.
-
-    ``(pos_x, pos_y, pos_z)`` is the desired tip position in the MuJoCo world.
-    For this scene the world and FR3 base frames are aligned. The other two
-    points encode the desired orientation: fingers lie along world x, while
-    the attachment site lies ``L`` above the tip.
-    """
+    """Create three targets around the desired TCP position in world coordinates."""
     L = float(link_length)
     cur_ee_rot = np.eye(3)
     target_att_pos = np.array([pos_x, pos_y, pos_z+L])
@@ -84,12 +57,11 @@ def build_ref_objects(pos_x, pos_y, pos_z,link_length):
     target_r_pos = np.array([pos_x - 0.3, pos_y, pos_z])
     
 
-    # At the desired tool orientation, the attachment is L above the tip and
-    # the two finger targets lie at +x/-x in world coordinates.
-    target_att = StaticObject(ObjectState(position=target_att_pos, rotation=cur_ee_rot, linear_velocity=np.zeros(3)),name = "target_attachment_site")
+    # The top target is L above the TCP; the lateral targets are at world +/-x.
+    target_top_spring = StaticObject(ObjectState(position=target_att_pos, rotation=cur_ee_rot, linear_velocity=np.zeros(3)),name = "target_attachment_site")
     target_l = StaticObject(ObjectState(position=target_l_pos, rotation=cur_ee_rot,linear_velocity=np.zeros(3)),name ="target_left_finger")
     target_r = StaticObject(ObjectState(position=target_r_pos, rotation=cur_ee_rot,linear_velocity=np.zeros(3)),name = "target_right_finger")
-    return target_att,target_l, target_r
+    return target_top_spring,target_l, target_r
 
 
 def orientation_from_points(attachment, left, right):
@@ -110,8 +82,7 @@ def main():
     parser.add_argument("--sub-topic", "--topic", dest="topic", type=str, default="/robot/joint_states", help="Topic to receive real robot states (default: /robot/joint_states)")
     parser.add_argument("--torque-pub-topic", type=str, default="/mujoco/robot/torques", help="Topic to publish computed joint torques (default: /mujoco/robot/torques)")
     parser.add_argument("--pub-rate", type=float, default=1000.0, help="Publish rate in Hz for outgoing ROS topics (default: 1000.0)")
-    parser.add_argument("--link-length", type=float, default=0.24, help="Length of extended rigid link in meters (default: 0.24)")
-    parser.add_argument("--mock-stream", action="store_true", help="Simulate receiving initial robot telemetry from ROS")
+    parser.add_argument("--link-length", type=float, default=0.4, help="Distance from TCP to the upper virtual spring site in meters (default: 0.4)")
     parser.add_argument("--stiffness", type=float, default=2000.0, help="VMC spring stiffness for each endpoint (N/m)")
     parser.add_argument("--damping", type=float, default=50.0, help="VMC damper coefficient for each endpoint (Ns/m)")
     parser.add_argument("--max-force", type=float, default=20.0, help="Maximum saturating VMC force per spring (N)")
@@ -125,20 +96,23 @@ def main():
     if args.state_timeout <= 0:
         parser.error("state-timeout must be positive")
 
-    # Fixed desired location of the custom tool tip, in world coordinates.
-    reference_position = (0.4, 0.0, 0.1)
+    # Fixed desired TCP location, in world coordinates, until ArUco updates it.
+    reference_position = (0.4, 0.0, 0.15)
 
-    # scene1.xml includes fr3.xml, so this single specification contains both
-    # the robot and the world. The custom sites are added before compilation.
-    scene_xml = Path(__file__).resolve().parent / "torque_control" / "model" / "scene1.xml"
-    if not scene_xml.exists():
-        raise FileNotFoundError(f"Scene XML not found at {scene_xml}.")
+    
+    # The combined scene contains the robot, gripper, and world. Add the three
+    # control sites to the Robotiq base before compiling the complete model.
+    menagerie = resolve_menagerie_path()
+    scene_xml = menagerie / "fr3_robotiq_2f_140" / "scene_fr3_robotiq.xml"
+    if not scene_xml.is_file():
+        raise FileNotFoundError(f"Modello non trovato: {scene_xml}")
     
 
     spec = mujoco.MjSpec.from_file(str(scene_xml))
     build_ee_link_model(spec, args.link_length)
-    target_att, target_left, target_right = build_ref_objects(*reference_position, args.link_length)
+    target_top_spring, target_left, target_right = build_ref_objects(*reference_position, args.link_length)
     model = spec.compile()
+    model.opt.disableflags |= mujoco.mjtDisableBit.mjDSBL_ACTUATION
     # The model stores geometry/parameters; MjData stores its current state and
     # computed quantities. This timestep only paces our Python loop below.
     model.opt.timestep = args.timestep
@@ -187,7 +161,6 @@ def main():
     camera_sub = bridge.node.create_subscription(PoseStamped, args.camera_topic, on_aruco_pose, 1)
 
     # Wait for the first measured pose before evaluating any virtual spring.
-    # Mock mode supplies one pose for debugging; it does not generate a stream.
     initial_qpos = None
     initial_qvel = None
     while initial_qpos is None:
@@ -198,11 +171,6 @@ def main():
             print(f"[ROS2] Received initial real robot joint state: {np.round(initial_qpos, 3)}")
             break
 
-        if args.mock_stream:
-            print("[INFO] Simulating initial real-robot telemetry (mock stream active)...")
-            initial_qpos = np.array([0.0, -0.4, 0.0, -2.1, 0.0, 1.9, -0.7853])
-            break
-
         time.sleep(0.05)
 
     # Inject the first measured positions and velocities. The damper uses
@@ -210,15 +178,14 @@ def main():
     # Subsequent messages update both arrays via apply_incoming_state().
     sync.set_state(data, initial_qpos, initial_qvel, forward=True)
 
-    # The tool tip and three point pairs are used for control diagnostics.
-    tip_id = model.site("ee_link_tip").id
-
-    att_site_id = model.site("attachment_site").id
+    # The TCP is the contact point; the other three sites anchor the springs.
+    tcp_id = model.site("tcp").id
+    top_spring_id = model.site("ee_top_spring").id
     left_grip_id = model.site("gripper_left_finger").id
     right_grip_id = model.site("gripper_right_finger").id
     # MuJoCoSite wraps a site so the VMC library can read its world position,
     # linear velocity, and force-to-joint mapping from the current MjData.
-    r_att_site = MuJoCoSite(att_site_id, "att_site")
+    r_top_site = MuJoCoSite(top_spring_id, "top_site")
     r_left_site = MuJoCoSite(left_grip_id, "left_finger")
     r_right_site = MuJoCoSite(right_grip_id, "right_finger")
 
@@ -228,8 +195,8 @@ def main():
     # not a bound on total force or joint torque. The damper is not saturated
     # by that spring parameter either.
     conn_att = VirtualConnection(
-        source=r_att_site,
-        target=target_att,
+        source=r_top_site,
+        target=target_top_spring,
         components=[
             TanhSpring(args.stiffness, max_force=args.max_force),
             LinearDamper(args.damping),
@@ -293,11 +260,12 @@ def main():
             p_target = p_marker - h * z_aruco
             p_left = p_target + 0.30 * x_aruco_in_base
             p_right = p_target - 0.30 * x_aruco_in_base
-            p_att   = p_target - args.link_length * z_aruco
+            # Match the simulation's top target: it lies along target +z.
+            p_top = p_target + args.link_length * z_aruco
 
             target_left.set_state(ObjectState(position=p_left, linear_velocity=np.zeros(3)))
             target_right.set_state(ObjectState(position=p_right, linear_velocity=np.zeros(3)))
-            target_att.set_state(ObjectState(position=p_att, linear_velocity=np.zeros(3)))
+            target_top_spring.set_state(ObjectState(position=p_top, linear_velocity=np.zeros(3)))
 
         if state_updated:
             last_state_time = time.perf_counter()
@@ -305,31 +273,34 @@ def main():
 
         if state_updated and (time.time() - last_telemetry_log > 1.0):
             # The active StaticObjects are the source of truth for both errors.
-            target_att_pos = target_att.state(model, data).position
+            target_att_pos = target_top_spring.state(model, data).position
             target_left_pos = target_left.state(model, data).position
             target_right_pos = target_right.state(model, data).position
             desired_tip_pos = (target_left_pos + target_right_pos) / 2.0
-            error_xyz = desired_tip_pos - data.site_xpos[tip_id]
+            error_xyz = desired_tip_pos - data.site_xpos[tcp_id]
 
             target_rotation = orientation_from_points(target_att_pos, target_left_pos, target_right_pos)
             measured_rotation = orientation_from_points(
-                data.site_xpos[att_site_id],
+                data.site_xpos[top_spring_id],
                 data.site_xpos[left_grip_id],
                 data.site_xpos[right_grip_id],
             )
-            relative_rotation = target_rotation @ measured_rotation.T
-            cosine = np.clip((np.trace(relative_rotation) - 1.0) / 2.0, -1.0, 1.0)
-            orientation_error_deg = np.degrees(np.arccos(cosine))
+            # The rotation vector gives the signed correction about the target
+            # frame's X, Y and Z axes (the ArUco axes after a camera update).
+            relative_rotation_target = target_rotation.T @ measured_rotation
+            orientation_error_xyz_deg = -np.degrees(
+                Rotation.from_matrix(relative_rotation_target).as_rotvec()
+            )
 
             connection_errors = [
-                np.linalg.norm(target_att_pos - data.site_xpos[att_site_id]),
+                np.linalg.norm(target_att_pos - data.site_xpos[top_spring_id]),
                 np.linalg.norm(target_left_pos - data.site_xpos[left_grip_id]),
                 np.linalg.norm(target_right_pos - data.site_xpos[right_grip_id]),
             ]
             print(
                 f"Errore punta xyz: {np.round(error_xyz, 4)} m; "
                 f"modulo: {np.linalg.norm(error_xyz):.4f} m; "
-                f"orientazione: {orientation_error_deg:.2f}°; "
+                f"errore orientazione target xyz: {np.round(orientation_error_xyz_deg, 2)}°; "
                 f"massimo sui 3 collegamenti: {max(connection_errors):.4f} m"
             )
             last_telemetry_log = time.time()
