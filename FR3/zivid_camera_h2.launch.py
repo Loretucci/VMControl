@@ -1,4 +1,4 @@
-"""Start the H2 ArUco camera publisher inside the Zivid container."""
+"""Start the H2 ArUco camera publisher in the PC2 host's Zivid environment."""
 
 from pathlib import Path
 
