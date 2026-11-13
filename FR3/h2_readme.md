@@ -74,7 +74,7 @@ nel container e caricare ROS:
 docker exec -it franka_ros2 bash
 source /opt/ros/humble/setup.bash
 source /ros2_ws/install/setup.bash
-export ROS_DOMAIN_ID=0
+export ROS_DOMAIN_ID=42
 export ROS_LOCALHOST_ONLY=0
 ```
 
@@ -146,7 +146,7 @@ Caricare ROS e avviare **solo** il gripper con il primo modo del launch:
 
 ```bash
 source /opt/ros/humble/setup.bash
-export ROS_DOMAIN_ID=0
+export ROS_DOMAIN_ID=42
 export ROS_LOCALHOST_ONLY=0
 ros2 launch ~/VMControl/FR3/h2_vmc.launch.py \
   start_h2:=false \
@@ -162,7 +162,7 @@ Da un secondo terminale host con ROS caricato:
 
 ```bash
 source /opt/ros/humble/setup.bash
-export ROS_DOMAIN_ID=0
+export ROS_DOMAIN_ID=42
 export ROS_LOCALHOST_ONLY=0
 ros2 topic echo /gripper/status --once
 ros2 topic echo /gripper/current_distance --once
@@ -179,7 +179,7 @@ In un altro terminale **host PC2**:
 
 ```bash
 source /opt/ros/humble/setup.bash
-export ROS_DOMAIN_ID=0
+export ROS_DOMAIN_ID=42
 export ROS_LOCALHOST_ONLY=0
 ros2 launch ~/VMControl/FR3/zivid_camera_h2.launch.py \
   python_executable:=/home/lorenzoantonio/venvs/zivid/bin/python \
@@ -229,7 +229,7 @@ Da qui in poi i comandi di questa sezione si eseguono **dentro la shell
 cd /workspace/VMControl
 source /opt/ros/humble/setup.bash
 source /opt/venv/bin/activate
-export ROS_DOMAIN_ID=0
+export ROS_DOMAIN_ID=42
 export ROS_LOCALHOST_ONLY=0
 export MUJOCO_MENAGERIE_PATH=/workspace/VMControl/fr3_robotiq_2f_140
 test -f "$MUJOCO_MENAGERIE_PATH/fr3_robotiq_2f_140/scene_fr3_robotiq.xml"
@@ -251,6 +251,10 @@ cat > "$vmc_udp_profile" <<'XML'
     <transport_descriptor>
       <transport_id>h2_udp</transport_id>
       <type>UDPv4</type>
+      <interfaceWhiteList>
+        <address>192.168.10.3</address>
+        <address>127.0.0.1</address>
+      </interfaceWhiteList>
     </transport_descriptor>
   </transport_descriptors>
   <participant profile_name="h2_udp_profile" is_default_profile="true">
