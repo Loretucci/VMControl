@@ -8,6 +8,10 @@ There are no robot torque publishers or physical gripper command publishers.
 
 The lab marker pose has +z pointing down toward the object. TCP +z follows
 that direction, so the upper force target lies along marker -z.
+
+During APPROACH, camera expiry captures the current three anchors as fixed
+targets. Both mechanisms remain active to hold that pose compliantly until
+a fresh camera pose arrives, matching h2_vmc_ros.py.
 """
 
 import argparse
@@ -75,7 +79,7 @@ def draw_capsule_line(scene, p1, p2, radius=0.0035, rgba=None):
 
 def build_ee_link_model(
     spec,
-    link_length: float = 0.4,
+    link_length: float = 0.8,
 ):
     """Attach three virtual-force anchors rigidly to the gripper body.
 
@@ -191,7 +195,7 @@ def main():
     parser.add_argument("--max-force", type=float, default=10.0)
     parser.add_argument("--max-force2", type=float, default=20.0,
                         help="second parallel spring force limit per axis (N)")
-    parser.add_argument("--link-length", type=float, default=0.4)
+    parser.add_argument("--link-length", type=float, default=0.8)
     parser.add_argument("--timestep", type=float, default=0.001)
     parser.add_argument("--close-time", type=float, default=1.0)
     parser.add_argument("--headless", action="store_true")
@@ -363,14 +367,14 @@ def main():
         t_arrival = None
         last_camera_time = first_camera_pose[2]
         camera_timeout = args.camera_timeout
-        camera_was_recent = None
+        camera_hold_active = False
         closing_timeout = 5.0
         t_close_request = None
         dt = model.opt.timestep
 
         def step_iteration():
             nonlocal latest_camera_pose, last_camera_time, last_telemetry_log
-            nonlocal t_arrival, phase, camera_was_recent
+            nonlocal t_arrival, phase, camera_hold_active
 
             # H2 gets q,dq from bridge.apply_incoming_state(). Here the same
             # synchronizer copies q,dq from the locally simulated FR3 instead.
@@ -381,9 +385,35 @@ def main():
                 latest_camera_pose = None
             if camera_pose is not None:
                 last_camera_time = camera_pose[2]
+
+            t_actual = time.perf_counter()
+            # The plant state is copied every iteration, so it has no ROS
+            # reception timeout. This version does not test PC1 connection loss.
+            robot_state_recent = True
+            camera_data_recent = t_actual - last_camera_time <= camera_timeout
+
+            # Match the real controller: capture the current anchors only once
+            # per camera loss. Copies keep these references fixed while the
+            # dynamic robot continues moving and both mechanisms remain active.
+            if phase == "APPROACH" and not camera_data_recent:
+                if not camera_hold_active and robot_state_recent:
+                    hold_top = data.site_xpos[top_spring_id].copy()
+                    hold_left = data.site_xpos[left_grip_id].copy()
+                    hold_right = data.site_xpos[right_grip_id].copy()
+                    hold_rotation = orientation_from_points(hold_top, hold_left, hold_right)
+                    update_positions(hold_top, hold_left, hold_right, hold_rotation,
+                                     target_top_spring, target_left, target_right)
+                    camera_hold_active = True
+                    print("[CAMERA] Pose timed out during APPROACH; holding the current end-effector pose")
+            elif camera_pose is not None:
+                # New observations resume tracking. Later phases retain the
+                # existing camera-update behavior, just like real H2.
                 new_p_top, new_p_left, new_p_right, new_rotation = build_positions(camera_pose, args.link_length)
                 update_positions(new_p_top, new_p_left, new_p_right, new_rotation,
                                  target_top_spring, target_left, target_right)
+                if camera_hold_active:
+                    camera_hold_active = False
+                    print("[CAMERA] Fresh pose received; tracking the ArUco again")
 
             # --- Same target/error calculations as H2 ---
             target_att_pos = target_top_spring.state(model, data).position
@@ -406,19 +436,9 @@ def main():
                 and max(connection_errors) < connection_tolerance
             )
             close_requested = False
-            t_actual = time.perf_counter()
-            # The plant state is copied on every iteration, so it has no ROS
-            # reception timeout. This version does not test PC1 connection loss.
-            robot_state_recent = True
-            camera_data_recent = t_actual - last_camera_time <= camera_timeout
-            if camera_data_recent != camera_was_recent:
-                if not camera_data_recent:
-                    print("[CAMERA] Pose timed out: keeping the last VMC target; new closing is inhibited")
-                elif camera_was_recent is False:
-                    print("[CAMERA] Fresh camera poses resumed")
-                camera_was_recent = camera_data_recent
 
             # --- Same APPROACH -> CLOSING decision and 0.5 s dwell as H2 ---
+            # HOLD errors can be small, but an expired camera still blocks closing.
             if phase == "APPROACH":
                 if within_tolerance and robot_state_recent and camera_data_recent:
                     if t_arrival is None:
@@ -474,6 +494,7 @@ def main():
                 dwell = 0.0 if t_arrival is None else t_actual - t_arrival
                 print(
                     f"[SIM] phase={phase}; sim_time={data_sim.time:.2f}s; "
+                    f"target_mode={'HOLD' if camera_hold_active else 'ARUCO'}; "
                     f"TCP error={np.round(error_xyz, 4)} m; "
                     f"connections={np.round(connection_errors, 4)} m; "
                     f"orientation error={np.round(orientation_error_xyz_deg, 2)} deg; "

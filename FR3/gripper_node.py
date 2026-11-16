@@ -48,8 +48,10 @@ pub /gripper/status           std_msgs/UInt8MultiArray [NEW] [gSTA, gOBJ, gFLT, 
 sub /gripper/stop             std_msgs/Bool            [NEW] True = stop (rGTO=0) + reject commands, False = release
 
 Node name: robotiq_gripper (e.g. `ros2 param get /robotiq_gripper force`)
-Parameters (fixed at start-up, defaults in __init__): port, command_cooldown_seconds, speed (64), force (30),
+Parameters (defaults in __init__): port, command_cooldown_seconds, speed (64), force (30),
                                 min_width (0.001), max_width (0.140), activation_timeout, watchdog_timeout
+force can be updated through ROS parameters and is read for every motion command.
+force_runtime_configurable=True is a read-only capability flag used by H2.
 Safety: commands outside [min_width, max_width] or NaN are rejected (not saturated); software stop
         (/gripper/stop); watchdog (no valid status for watchdog_timeout s, or gSTA != 3 -> commands disabled).
 
@@ -64,6 +66,7 @@ import rclpy
 import rclpy.duration  # [NEW]
 from pymodbus.client import ModbusSerialClient
 from rclpy.node import Node
+from rcl_interfaces.msg import IntegerRange, ParameterDescriptor
 from std_msgs.msg import Bool, Float64, UInt8MultiArray  # [NEW] Bool, UInt8MultiArray
 
 
@@ -88,7 +91,20 @@ class RobotiqGripperNode(Node):
         )
         
         self.speed = max(0, min(self.declare_parameter("speed", 64).value, 255))  # [NEW] Speed and force of the fingers, 0-255 each (relative, not calibrated): fixed at start-up.
-        self.force = max(1, min(self.declare_parameter("force", 30).value, 255))  # 0 disables re-grasp
+        # rFR is a register setting, not a calibrated force in Newtons. Validate
+        # startup overrides and later ROS parameter updates without clamping.
+        self.force = self.declare_parameter(
+            "force", 30,
+            ParameterDescriptor(
+                description="Robotiq force register rFR, 1-255 (not Newtons)",
+                integer_range=[IntegerRange(from_value=1, to_value=255, step=1)],
+            ),
+        ).value
+        self.declare_parameter(
+            "force_runtime_configurable", True,
+            ParameterDescriptor(description="Force is read for every motion command", read_only=True),
+            ignore_override=True,
+        )
 
         # [NEW] Accepted command range [m]: commands outside are REJECTED (not saturated)
         self.min_width = self.declare_parameter("min_width", 0.001).value  # 0.0 is the tracker "hand lost"
@@ -311,8 +327,15 @@ class RobotiqGripperNode(Node):
             mapped_position = int((1.0 - (target_width / self.width_limit)) * 255.0)
             mapped_position = max(0, min(mapped_position, 255))
 
+        # Read the accepted ROS parameter for this command. H2 may have changed
+        # it since activation; a startup-only cached value would ignore that.
+        force = self.get_parameter("force").value
+        if type(force) is not int or not 1 <= force <= 255:
+            self.get_logger().error("Command rejected: force must be an integer from 1 to 255")
+            return
+        self.force = force
+
         # 4. Modbus FC16 registers: rACT=1 + rGTO=1 | rPR | speed, force
-        # [NEW] speed / force from the parameters (Omar: fixed 0xFF7F)
         registers = [0x0900, mapped_position, (self.speed << 8) | self.force]
 
         try:

@@ -5,6 +5,10 @@ measured joint positions and velocities. MuJoCo computes kinematics and maps
 the virtual spring/damper forces to joint torques. The robot trajectory comes
 from ROS; this file does not advance the robot with ``mj_step``. The optional
 passive viewer displays the measured configuration.
+
+During APPROACH, a camera timeout retargets both mechanisms once to the
+current measured site positions. Springs and dampers then hold that pose
+compliantly until a fresh camera pose arrives. This is not a hard brake.
 """
 
 import argparse
@@ -32,9 +36,27 @@ from mujoco_vmc import (
     resolve_menagerie_path,
 )
 
+
+def draw_sphere(scene, pos, radius=0.015, rgba=None):
+    """Draw a viewer-only target without adding physical model geometry."""
+    if scene.ngeom >= scene.maxgeom:
+        return False
+    color = [0.2, 0.6, 1.0, 0.9] if rgba is None else rgba
+    mujoco.mjv_initGeom(
+        scene.geoms[scene.ngeom],
+        type=mujoco.mjtGeom.mjGEOM_SPHERE,
+        size=np.array([radius, 0.0, 0.0], dtype=float),
+        pos=np.asarray(pos, dtype=float),
+        mat=np.eye(3).ravel(),
+        rgba=np.asarray(color, dtype=np.float32),
+    )
+    scene.ngeom += 1
+    return True
+
+
 def build_ee_link_model(
     spec,
-    link_length: float = 0.4,
+    link_length: float = 0.8,
 ):
     """Attach three virtual-force anchors rigidly to the gripper body.
 
@@ -76,13 +98,14 @@ def build_positions(camera_pose, link_length):
     x_aruco_in_base = R_base_aruco[:, 0]
     z_aruco = R_base_aruco[:, 2]
     # With h=0, the desired TCP coincides with the marker origin. The side
-    # targets lie along marker x and the top target along marker z.
+    # targets lie along marker x. The upper robot site is at -L along TCP z,
+    # so matching TCP +z to marker +z puts its target along marker -z.
     h = 0.0
     p_target = p_marker - h * z_aruco
     p_left = p_target + 0.30 * x_aruco_in_base
     p_right = p_target - 0.30 * x_aruco_in_base
-    # This is the position the upper gripper site is pulled toward.
-    p_top = p_target + L * z_aruco
+    # For the measured lab marker (+z downward), this point is above the marker.
+    p_top = p_target - L * z_aruco
     
     return p_top,p_left,p_right, R_base_aruco
 
@@ -130,11 +153,72 @@ def orientation_from_points(attachment, left, right):
     y_axis = np.cross(z_axis, x_axis)
     return np.column_stack((x_axis, y_axis, z_axis))
 
+
+def configure_gripper_force(node, force, timeout=5.0):
+    """Configure rFR through ROS parameter services before starting control.
+
+    RobotROSBridge already spins this node on its own thread. Wait for each
+    asynchronous response here during initialization, without spinning the
+    same node again or blocking the later torque-computation loop.
+    """
+    from rcl_interfaces.msg import Parameter, ParameterType, ParameterValue
+    from rcl_interfaces.srv import GetParameters, SetParameters
+
+    if type(force) is not int or not 1 <= force <= 255:
+        raise ValueError("gripper-force must be an integer from 1 to 255 (rFR, not Newtons)")
+    if node is None:
+        raise RuntimeError("The ROS bridge node is not ready")
+    clients = []
+
+    def call_parameter_service(service_type, service_name, request):
+        client = node.create_client(service_type, service_name)
+        clients.append(client)
+        if not client.wait_for_service(timeout_sec=timeout):
+            raise RuntimeError(f"Gripper service unavailable: {service_name}; start the gripper node first")
+        future = client.call_async(request)
+        deadline = time.perf_counter() + timeout
+        while not future.done():
+            if time.perf_counter() >= deadline:
+                future.cancel()
+                raise TimeoutError(f"Gripper service did not respond: {service_name}")
+            time.sleep(0.01)
+        response = future.result()
+        if response is None:
+            raise RuntimeError(f"No response from gripper service: {service_name}")
+        return response
+
+    try:
+        # Older gripper_node.py versions accept ROS parameter changes but keep
+        # using the force cached at startup. Require the updated implementation.
+        request = GetParameters.Request()
+        request.names = ["force_runtime_configurable"]
+        response = call_parameter_service(GetParameters, "/robotiq_gripper/get_parameters", request)
+        if (len(response.values) != 1
+                or response.values[0].type != ParameterType.PARAMETER_BOOL
+                or not response.values[0].bool_value):
+            raise RuntimeError("Restart the updated gripper_node.py: runtime force configuration is not supported by the running node")
+
+        request = SetParameters.Request()
+        request.parameters = [Parameter(
+            name="force",
+            value=ParameterValue(type=ParameterType.PARAMETER_INTEGER, integer_value=force),
+        )]
+        response = call_parameter_service(SetParameters, "/robotiq_gripper/set_parameters", request)
+        if len(response.results) != 1 or not response.results[0].successful:
+            reason = response.results[0].reason if response.results else "missing result"
+            raise RuntimeError(f"Gripper force configuration rejected: {reason}")
+        print(f"[GRIPPER] Force configured: rFR={force} (1-255, not Newtons); used on the next motion command")
+    finally:
+        for client in clients:
+            node.destroy_client(client)
+
+
 def main():
     """Set up ROS, the virtual mechanism, and the torque computation loop."""
     # Startup prerequisite: gripper_node.py must complete its activation and
     # return to the open position before this script is launched. The waits
-    # below cover the first camera pose and robot state, not gripper readiness.
+    # below cover the first camera pose, robot state and force configuration;
+    # accepting the force parameter does not confirm that opening has finished.
     # Configuration is kept on the command line so the ROS topic names and
     # mechanism gains can be changed without editing the model file. Topic
     # names must match the physical controller and camera publishers.
@@ -142,7 +226,8 @@ def main():
     parser.add_argument("--sub-topic", "--topic", dest="topic", type=str, default="/robot/joint_states", help="Topic to receive real robot states (default: /robot/joint_states)")
     parser.add_argument("--torque-pub-topic", type=str, default="/mujoco/robot/torques", help="Topic to publish computed joint torques (default: /mujoco/robot/torques)")
     parser.add_argument("--pub-rate", type=float, default=1000.0, help="Publish rate in Hz for outgoing ROS topics (default: 1000.0)")
-    parser.add_argument("--link-length", type=float, default=0.4, help="Distance from TCP to the upper virtual spring site in meters (default: 0.4)")
+    parser.add_argument("--link-length", type=float, default=0.8, help="Distance from TCP to the upper virtual spring site in meters (default: 0.4)")
+    parser.add_argument("--target-radius", type=float, default=0.015, help="Radius of viewer-only target spheres in meters (default: 0.015)")
     parser.add_argument("--stiffness", type=float, default=2000.0, help="VMC spring stiffness for each endpoint (N/m)")
     parser.add_argument("--stiffness2", type=float, default=20.0, help="VMC spring stiffness2 for each endpoint (N/m)")
     parser.add_argument("--damping", type=float, default=50.0, help="VMC damper coefficient for each endpoint (Ns/m)")
@@ -153,12 +238,17 @@ def main():
     parser.add_argument("--headless", action="store_true", help="Run in headless mode without passive viewer")
     parser.add_argument("--duration", type=float, default=60.0, help="Run duration in seconds if headless (<= 0 runs indefinitely)")
     parser.add_argument("--camera-topic", type = str, default = "/vision/aruco_pose", help="Topic on which receiving ArUco pose")
+    parser.add_argument("--gripper-force", type=int, default=30, help="Robotiq force setting rFR, integer 1-255 (not Newtons); default: 30")
     #parser.add_argument("--scene", type = str, default = "mujoco/")
     args = parser.parse_args()
     # A nonpositive state timeout would make every measurement immediately
     # stale and would suppress all virtual mechanism torque.
     if args.state_timeout <= 0:
         parser.error("state-timeout must be positive")
+    if not np.isfinite(args.target_radius) or args.target_radius <= 0:
+        parser.error("target-radius must be finite and positive")
+    if not 1 <= args.gripper_force <= 255:
+        parser.error("gripper-force must be between 1 and 255 (rFR, not Newtons)")
 
     # Only APPROACH can issue a close request. The two thresholds must both be
     # satisfied before entering CLOSING: TCP-to-target distance and the worst
@@ -272,6 +362,14 @@ def main():
     camera_sub = bridge.node.create_subscription(PoseStamped, args.camera_topic, camera_callback, 1)
     gripper_sub = bridge.node.create_subscription(Bool, "/gripper/object_detected", gripper_obj_det_cb, 10)
     gripper_status_sub = bridge.node.create_subscription(UInt8MultiArray, "/gripper/status", gripper_status_cb, 10)
+
+    # Configure and confirm the actual driver's force before any VMC torque
+    # is buffered. This parameter request does not itself move the fingers.
+    try:
+        configure_gripper_force(bridge.node, args.gripper_force)
+    except (Exception, KeyboardInterrupt):
+        bridge.stop()
+        raise
 
     # --- Wait for initial measured inputs ---
     # The first camera pose defines the initial virtual target; starting from
@@ -396,6 +494,7 @@ def main():
     t_arrival = None
     last_camera_time = first_camera_pose[2]
     camera_timeout = 0.8 # Seconds without a new camera pose before it is stale.
+    camera_hold_active = False
     closing_timeout = 5.0 # Initial closing timeout; tune from measured gripper motion.
 
     def step_iteration():
@@ -408,6 +507,7 @@ def main():
         from the outer loop after the arrival condition has held long enough.
         """
         nonlocal last_telemetry_log, last_state_time, state_timeout_logged, latest_camera_pose, phase, position_tolerance, connection_tolerance, t_arrival, last_camera_time
+        nonlocal camera_hold_active
         # --- Read the newest ROS measurements ---
         # Consume the most recent JointState, if available. With forward=True,
         # the synchronizer refreshes MuJoCo site poses and velocities using
@@ -419,18 +519,41 @@ def main():
             camera_pose = latest_camera_pose
             latest_camera_pose = None
         
-        # Update the three Python-side targets only for a newly received pose.
-        # No camera message means they retain their last positions; the
-        # freshness check below can still reject an old target for grasping.
         if camera_pose is not None:
             last_camera_time = camera_pose[2]
-            new_p_top, new_p_left, new_p_right, new_rotation = build_positions(camera_pose, args.link_length)
-            update_positions(new_p_top, new_p_left, new_p_right, new_rotation, target_top_spring, target_left, target_right)
 
         if state_updated:
             # This receive time is used for the controller's stale-state gate.
             last_state_time = time.perf_counter()
             state_timeout_logged = False
+
+        t_actual = time.perf_counter()
+        robot_state_recent = t_actual - last_state_time <= args.state_timeout
+        camera_data_recent = t_actual - last_camera_time <= camera_timeout
+
+        # If the camera is lost during APPROACH, capture the current measured
+        # anchors once. Copy the arrays so future robot motion cannot move the
+        # held targets through a view into data.site_xpos. Do not capture a pose
+        # from expired robot telemetry; the existing state-timeout gate applies.
+        if phase == "APPROACH" and not camera_data_recent:
+            if not camera_hold_active and robot_state_recent:
+                hold_top = data.site_xpos[top_spring_id].copy()
+                hold_left = data.site_xpos[left_grip_id].copy()
+                hold_right = data.site_xpos[right_grip_id].copy()
+                hold_rotation = orientation_from_points(hold_top, hold_left, hold_right)
+                update_positions(hold_top, hold_left, hold_right, hold_rotation,
+                                 target_top_spring, target_left, target_right)
+                camera_hold_active = True
+                print("[CAMERA] Pose timed out during APPROACH; holding the current end-effector pose")
+        elif camera_pose is not None:
+            # Resume tracking with the new observation. CLOSING and later
+            # phases keep their existing camera-update behavior.
+            new_p_top, new_p_left, new_p_right, new_rotation = build_positions(camera_pose, args.link_length)
+            update_positions(new_p_top, new_p_left, new_p_right, new_rotation,
+                             target_top_spring, target_left, target_right)
+            if camera_hold_active:
+                camera_hold_active = False
+                print("[CAMERA] Fresh pose received; tracking the ArUco again")
 
         # --- Compare measured gripper sites with the virtual targets ---
         # The active StaticObjects are the source of truth for both errors.
@@ -471,6 +594,7 @@ def main():
             )
 
             print(
+                f"target_mode={'HOLD' if camera_hold_active else 'ARUCO'}; "
                 f"Errore punta xyz: {np.round(error_xyz, 4)} m; "
                 f"modulo: {np.linalg.norm(error_xyz):.4f} m; "
                 f"errore orientazione target xyz: {np.round(orientation_error_xyz_deg, 2)}°; "
@@ -485,11 +609,8 @@ def main():
         within_tolerance = (np.linalg.norm(error_xyz) < position_tolerance and max(connection_errors) < connection_tolerance)
         close_requested = False
 
-        # perf_counter is monotonic, so elapsed-time comparisons are not
-        # affected by wall-clock changes on the computer.
-        t_actual = time.perf_counter()
-        robot_state_recent = t_actual - last_state_time <= args.state_timeout
-        camera_data_recent = t_actual - last_camera_time <= camera_timeout
+        # Freshness was evaluated before selecting the targets. An expired
+        # camera inhibits closing even when the held-pose error is near zero.
         if phase == "APPROACH":
             # Start a dwell timer on first arrival. Reset it whenever either
             # error or input freshness leaves the allowed region.
@@ -614,6 +735,22 @@ def main():
                     # Rendering is limited to about 30 Hz while the control
                     # loop follows the shorter --timestep pacing interval.
                     if now >= next_viewer_sync:
+                        # StaticObject targets have no XML site size. Render
+                        # their current states in the viewer's user scene so
+                        # the markers follow both camera updates and HOLD.
+                        with v.lock():
+                            v.user_scn.ngeom = 0
+                            for target, color in (
+                                (target_top_spring, [0.1, 0.9, 1.0, 0.9]),
+                                (target_left, [0.4, 1.0, 0.4, 0.9]),
+                                (target_right, [1.0, 0.4, 0.7, 0.9]),
+                            ):
+                                draw_sphere(v.user_scn, target.state(model, data).position,
+                                            radius=args.target_radius, rgba=color)
+                            desired_tcp = (target_left.state(model, data).position
+                                           + target_right.state(model, data).position) / 2.0
+                            draw_sphere(v.user_scn, desired_tcp,
+                                        radius=args.target_radius, rgba=[1.0, 0.8, 0.1, 0.9])
                         v.sync()
                         next_viewer_sync = now + 1.0 / 30.0
                     next_tick += dt

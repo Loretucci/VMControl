@@ -120,7 +120,7 @@ def main():
 
     # Fixed camera-to-base calibration from the lab calibration session.
     T_base_camera = np.load(
-        "/home/lorenzoantonio/zivid_ws/calib_2026-10-21/calibration_outputs/T_cam_to_base_Zivid.npy"
+        "/home/lorenzoantonio/zivid_ws/calib_board_2026-11-12_1628/T_cam_to_base_Zivid_board.npy"
     )
     
     node, publisher = camera_publisher()

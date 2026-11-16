@@ -21,10 +21,12 @@ def _launch_selected_process(context, script_dir):
         # This branch is intended for the PC2 host venv that has pymodbus and
         # access to the gripper's USB serial adapter.
         gripper_port = LaunchConfiguration("gripper_port").perform(context)
+        gripper_force = LaunchConfiguration("gripper_force").perform(context)
         command = [
             python_executable,
             str(script_dir / "gripper_node.py"),
             "--ros-args", "-p", f"port:={gripper_port}",
+            "-p", f"force:={gripper_force}",
         ]
     elif start_h2 == "true":
         # This branch is intended for /opt/venv in the VMC container. Default
@@ -35,8 +37,10 @@ def _launch_selected_process(context, script_dir):
             ("sub_topic", "--sub-topic"),
             ("torque_pub_topic", "--torque-pub-topic"),
             ("camera_topic", "--camera-topic"),
+            ("gripper_force", "--gripper-force"),
             ("pub_rate", "--pub-rate"),
             ("link_length", "--link-length"),
+            ("target_radius", "--target-radius"),
             ("stiffness", "--stiffness"),
             ("damping", "--damping"),
             ("max_force", "--max-force"),
@@ -73,11 +77,13 @@ def generate_launch_description():
             description="false: gripper only on the host; true: H2 only in the VMC shell",
         ),
         DeclareLaunchArgument("gripper_port", default_value="/dev/ttyUSB0"),
+        DeclareLaunchArgument("gripper_force", default_value="30", description="Robotiq rFR setting, integer 1-255 (not Newtons)"),
         DeclareLaunchArgument("sub_topic", default_value="/robot2/franka/joint_states"),
         DeclareLaunchArgument("torque_pub_topic", default_value="/vmc/h2_dry_run_torques"),
         DeclareLaunchArgument("camera_topic", default_value="/vision/aruco_pose"),
         DeclareLaunchArgument("pub_rate", default_value="1000.0"),
         DeclareLaunchArgument("link_length", default_value="0.4"),
+        DeclareLaunchArgument("target_radius", default_value="0.015"),
         DeclareLaunchArgument("stiffness", default_value="2000.0"),
         DeclareLaunchArgument("damping", default_value="50.0"),
         DeclareLaunchArgument("max_force", default_value="20.0"),

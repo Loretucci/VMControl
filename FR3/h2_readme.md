@@ -143,7 +143,8 @@ export ROS_LOCALHOST_ONLY=0
 ros2 launch ~/VMControl/FR3/h2_vmc.launch.py \
   start_h2:=false \
   python_executable:=/home/lorenzoantonio/venvs/vmc/bin/python \
-  gripper_port:=/dev/ttyUSB0
+  gripper_port:=/dev/ttyUSB0 \
+  gripper_force:=30
 ```
 
 Il launch resta aperto. Il nodo fa reset, attivazione/calibrazione e invia un
@@ -164,6 +165,13 @@ ros2 topic echo /gripper/current_distance --once
 le dita sono ancora in moto. Prima di H2 attendere `gSTA=3`, `gOBJ=3`,
 `gFLT=0` e distanza vicina a `0.14 m`. Se il nodo segnala un guasto o la porta
 non è accessibile, risolverlo prima di continuare. Lasciare aperto il launch.
+
+La versione aggiornata di `gripper_node.py` legge il parametro ROS `force`
+a ogni comando di movimento. Dopo aver scaricato questa modifica occorre
+riavviare il nodo per caricarla: il riavvio esegue di nuovo attivazione e
+apertura. H2 riconosce la versione aggiornata tramite il parametro read-only
+`force_runtime_configurable=True` e rifiuta di partire con una vecchia
+istanza che continuerebbe a usare la forza memorizzata all'avvio.
 
 ## 4. PC2 host — avviare la camera Zivid
 
@@ -321,11 +329,13 @@ ros2 launch /workspace/VMControl/FR3/h2_vmc.launch.py \
   python_executable:=/opt/venv/bin/python \
   sub_topic:=/robot1/franka/joint_states \
   camera_topic:=/vision/aruco_pose \
+  gripper_force:=30 \
   torque_pub_topic:=/robot1/torque_subscriber_controller/external_torques \
   stiffness:=600 \
   damping:=30 \
   max_force:=10 \
   headless:=false \
+  target_radius:=0.015 \
   duration:=0
 ```
 
@@ -335,6 +345,49 @@ finché non viene fermato. H2 attende una prima posa camera valida e un primo
 lo stato reale misurato, calcola le coppie nel modello virtuale e le pubblica
 verso il controller. Non chiama `mj_step` per far evolvere un secondo robot
 dinamico.
+
+La forza del gripper si sceglie dal parser H2 con `--gripper-force 30`, o dal
+launch con `gripper_force:=30`. E un intero nella scala del registro Robotiq
+`rFR` (1-255 nel nostro nodo), non una forza in Newton. Il default rimane 30.
+All'avvio, prima di calcolare o pubblicare coppie VMC, H2 controlla che il
+nodo gripper supporti l'aggiornamento e imposta `force` tramite i servizi ROS
+`/robotiq_gripper/get_parameters` e `/robotiq_gripper/set_parameters`.
+Attende la conferma: se il servizio manca, non risponde o rifiuta il valore,
+H2 termina senza iniziare il controllo. La richiesta di parametro non muove
+le dita; il valore viene inserito nel registro Modbus al successivo comando
+di apertura/chiusura. Nel log compare `[GRIPPER] Force configured: rFR=...`.
+Per leggere la configurazione dal terminale host con ROS caricato:
+
+```bash
+ros2 param get /robotiq_gripper force
+```
+
+Il valore `rFR` imposta il limite di corrente del motore secondo il
+[manuale Robotiq](https://assets.robotiq.com/website-assets/support_documents/document/2F-85_2F-140_Instruction_Manual_CB_PDF_20190725.pdf).
+La chiusura visuale di `h2_camera_simulation.py`, basata su un'equality, non
+modella questa forza del motore reale.
+
+La configurazione e stata verificata localmente con servizi ROS e scritture
+Modbus sostituiti: valore trasmesso, aggiornamento al comando successivo e
+byte `rFR` corretti; controllati anche vecchio nodo, rifiuto del parametro,
+servizio assente e timeout. La comunicazione effettiva e la forza applicata
+dal gripper fisico restano da verificare sul PC2.
+
+Durante `APPROACH`, se non arriva una posa camera valida per piu di 0,8 s,
+H2 salva una sola volta le posizioni correnti dei tre site, usando uno stato
+robot recente, e le usa come riferimenti fissi. Entrambi i meccanismi
+rimangono attivi: le coppie sono ricalcolate a ogni iterazione per richiamare
+il gripper verso quella posa e smorzarne la velocita. Non viene conservato
+l'ultimo vettore di coppie. Il log indica `target_mode=HOLD` e la richiesta
+di chiusura resta inibita. Quando torna una posa camera valida si riprende
+automaticamente l'inseguimento dell'ArUco. La perdita e rilevata tramite il
+timeout, non da una notifica immediata di marker assente.
+
+Questo e un mantenimento cedevole della posa dell'end-effector: non blocca
+rigidamente i giunti e non costituisce un arresto di sicurezza. Compensazione
+di gravita e comportamento del controller PC1 vanno verificati sul sistema
+effettivo. Se scade anche lo stato del robot, resta il precedente comportamento
+di pubblicazione di zero coppia VMC aggiuntiva.
 
 Questa configurazione può muovere il **robot reale** e può chiedere al nodo
 gripper una chiusura su `/hand/finger_distance`: la prova non è ancora stata
@@ -384,6 +437,7 @@ del file launch: usare il comando completo per riprodurre questa configurazione.
 | `sub_topic` | `/robot1/franka/joint_states` | Stati reali letti da H2 |
 | `torque_pub_topic` | `/robot1/torque_subscriber_controller/external_torques` | Coppie inviate al controller reale |
 | `camera_topic` | `/vision/aruco_pose` | Posa target della Zivid |
+| `gripper_force` | `30` | Registro di forza Robotiq rFR, intero 1-255, non Newton |
 | `pub_rate` | `1000.0` Hz | Frequenza ROS richiesta dal launch |
 | `link_length` | `0.4` m | Distanza TCP–site superiore |
 | `stiffness` | `600` N/m | Rigidezza per collegamento |
@@ -393,9 +447,18 @@ del file launch: usare il comando completo per riprodurre questa configurazione.
 | `state_timeout` | `0.2` s | Soglia di stato robot scaduto |
 | `duration` | `0` | Continuo fino a stop |
 | `headless` | `false` | Apre il viewer |
+| `target_radius` | `0.015` m | Raggio delle sfere che mostrano i target nel viewer |
 
 Il parser legge i valori all'avvio: dopo una modifica occorre fermare e
 rilanciare H2.
+
+Con il viewer attivo, H2 mostra i tre riferimenti `StaticObject` come sfere:
+ciano per il punto superiore, verde per il sinistro e rosa per il destro.
+Una sfera gialla indica il TCP desiderato, al centro dei due target laterali.
+Il raggio predefinito e 1,5 cm; si cambia con `target_radius:=0.02` nel launch
+oppure `--target-radius 0.02` nello script Python. Le sfere seguono i
+riferimenti attivi anche in `HOLD`. Sono elementi grafici della scena utente:
+non aggiungono masse, collisioni o modifiche alle tolleranze del controllo.
 
 ## 9. Arresto e note pratiche
 
@@ -537,9 +600,9 @@ gripper si trova lungo -z del TCP, quindi il suo target viene costruito con
 Con quella posa, il precedente segno `+` metteva il target superiore a
 z=-0,331 m e richiedeva un assetto con il corpo del gripper sotto il piano;
 la simulazione restava in contatto con il pavimento. Il segno `-` mette il
-target superiore a z=0,469 m. Questa correzione e nel file di simulazione;
-la formula nel file reale va controllata e allineata prima di trasferire
-il risultato al robot fisico.
+target superiore a z=0,469 m. La formula e stata allineata sia nel file di
+simulazione sia in `h2_vmc_ros.py`. La correzione e stata verificata nella
+simulazione; la prova con il robot fisico resta da eseguire.
 
 Il viewer e attivo per default. Usa il display Linux del PC2; se ricompare
 l'errore GLFW/X11, seguire il paragrafo "Viewer X11" della sezione 5. Per una
@@ -560,11 +623,17 @@ di controllo. Dopo, la sequenza e:
 5. Richiedere la chiusura simulata quando TCP e tre collegamenti restano entro
    1 cm per 0,5 s con una posa camera recente.
 
-Per riprodurre il comportamento attuale di `h2_vmc_ros.py`, oltre 0,8 s senza
-una posa valida si impedisce una nuova chiusura ma resta attivo l'ultimo
-target VMC. Durante `CLOSING` le nuove pose continuano ad aggiornare i target
-e non annullano la chiusura. Questi eventi sono stampati insieme a un
-riepilogo degli errori una volta al secondo.
+La simulazione e allineata al mantenimento della posa di `h2_vmc_ros.py`:
+durante `APPROACH`, oltre 0,8 s senza una posa valida, salva una sola volta
+le posizioni correnti dei tre site e le mantiene come riferimenti fissi.
+Entrambi i meccanismi restano attivi e la dinamica MuJoCo continua a evolvere
+con le coppie ricalcolate verso quella posa. Il log mostra `target_mode=HOLD`;
+gli errori si riferiscono alla posa salvata, non al marker non osservato.
+La chiusura e inibita anche se questi errori diventano piccoli. Alla nuova
+posa valida si riprende automaticamente l'inseguimento dell'ArUco, con
+`target_mode=ARUCO`. Durante `CLOSING` le nuove pose continuano ad aggiornare
+i target e non annullano la chiusura in entrambi gli script. Questi eventi
+sono stampati insieme a un riepilogo degli errori una volta al secondo.
 
 `CLOSED` conferma soltanto che le dita simulate hanno raggiunto l'angolo di
 chiusura. La camera non ricostruisce automaticamente un oggetto fisico in
@@ -583,3 +652,10 @@ ROS e il clock sono stati sostituiti localmente con la posa ricevuta e un
 clock di test. Le verifiche precedenti su target sintetici hanno controllato
 la somma delle coppie, il timeout camera e l'aggiornamento durante la
 chiusura. Il nuovo comportamento va riprovato con camera e viewer sul PC2.
+
+Verificato localmente anche il nuovo `HOLD`, con dinamica MuJoCo e ingresso
+camera/clock sostituiti: acquisizione unica dei tre site dopo il timeout,
+riferimenti fissi mentre il robot continua a evolvere, entrambi i meccanismi
+attivi, nessuna chiusura durante la perdita e ripresa al ritorno delle pose.
+Verificato che la perdita della camera durante `CLOSING` non attivi `HOLD`
+e che la chiusura simulata prosegua.
