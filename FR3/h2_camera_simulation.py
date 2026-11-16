@@ -26,10 +26,49 @@ from mujoco_vmc import (
     TanhSpring,
     VirtualConnection,
     VirtualMechanism,
-    draw_capsule_line,
-    draw_sphere,
     resolve_menagerie_path,
 )
+
+
+def draw_sphere(scene, pos, radius=0.012, rgba=None):
+    """Draw a viewer-only target without depending on VMC visual exports."""
+    if scene.ngeom >= scene.maxgeom:
+        return False
+    color = [0.2, 0.6, 1.0, 0.8] if rgba is None else rgba
+    mujoco.mjv_initGeom(
+        scene.geoms[scene.ngeom],
+        type=mujoco.mjtGeom.mjGEOM_SPHERE,
+        size=np.array([radius, 0.0, 0.0], dtype=float),
+        pos=np.asarray(pos, dtype=float),
+        mat=np.eye(3).ravel(),
+        rgba=np.asarray(color, dtype=np.float32),
+    )
+    scene.ngeom += 1
+    return True
+
+
+def draw_capsule_line(scene, p1, p2, radius=0.0035, rgba=None):
+    """Draw one visual connection using MuJoCo's native connector helper."""
+    if scene.ngeom >= scene.maxgeom:
+        return False
+    start = np.asarray(p1, dtype=float)
+    end = np.asarray(p2, dtype=float)
+    if np.linalg.norm(end - start) < 1e-4:
+        return False
+    color = [0.1, 0.9, 0.3, 0.8] if rgba is None else rgba
+    geom = scene.geoms[scene.ngeom]
+    mujoco.mjv_initGeom(
+        geom,
+        type=mujoco.mjtGeom.mjGEOM_CAPSULE,
+        size=np.zeros(3),
+        pos=np.zeros(3),
+        mat=np.eye(3).ravel(),
+        rgba=np.asarray(color, dtype=np.float32),
+    )
+    mujoco.mjv_connector(geom, mujoco.mjtGeom.mjGEOM_CAPSULE, radius, start, end)
+    scene.ngeom += 1
+    return True
+
 
 def build_ee_link_model(
     spec,
@@ -134,7 +173,7 @@ def main():
     # ROS is needed only when running main. The geometry helpers remain usable
     # for local headless checks on a Mac without a ROS installation.
     from geometry_msgs.msg import PoseStamped
-    from mujoco_vmc.utils.ros import RobotROSBridge
+    from mujoco_vmc import RobotROSBridge
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--scene", type=Path, help="combined scene XML; otherwise use MUJOCO_MENAGERIE_PATH")
