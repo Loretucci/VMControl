@@ -489,10 +489,15 @@ MuJoCo. Lo script non pubblica comandi di coppia o di chiusura e non legge gli
 stati del robot reale. Per questa prova non servono il controller sul PC1 o
 il nodo del gripper fisico.
 
-Portare sul PC2 **entrambi** i file `h2_camera_simulation.py` e
-`h2_simulations.py`: il primo importa dal secondo le funzioni geometriche,
-senza eseguirne il `main`. Servono anche il modello FR3/Robotiq con le mesh e
-la libreria `mujoco_vmc` gia usati sul PC2.
+Portare sul PC2 `h2_camera_simulation.py`. Il file mantiene la struttura di
+`h2_vmc_ros.py`: funzioni geometriche con gli stessi nomi, connessioni
+`conn_att`, `conn_left`, `conn_right` esplicite nel `main`, poi
+`step_iteration()`. Include anche `conn_att_2`, `conn_left_2`, `conn_right_2`
+e `mechanism_2`: tre molle aggiuntive in parallelo ai primi tre collegamenti.
+La prima serie ha molla e damper, la seconda ha solo la molla. Nel ciclo
+vengono applicati entrambi i meccanismi, sommando le coppie. Non importa piu
+codice da `h2_simulations.py`. Servono anche il modello FR3/Robotiq con le
+mesh e la libreria `mujoco_vmc` gia usati sul PC2.
 
 Avviare la camera dall'host PC2 come nella sezione 4; se e gia in esecuzione,
 usare quella istanza. La posa deve essere in metri con `frame_id="base"`.
@@ -511,23 +516,34 @@ cd /workspace/VMControl/FR3
   --scene /workspace/VMControl/fr3_robotiq_2f_140/fr3_robotiq_2f_140/scene_fr3_robotiq.xml \
   --camera-topic /vision/aruco_pose \
   --stiffness 600 \
+  --stiffness2 2000 \
   --damping 30 \
   --max-force 10 \
+  --max-force2 20 \
   --duration 0
 ```
+
+`--stiffness2` e `--max-force2` controllano solo le molle della seconda serie;
+i default sono rispettivamente 2000 N/m e 20 N per componente. Per escludere
+il loro contributo durante un confronto si puo usare `--stiffness2 0`.
+Nel file reale attualmente la seconda serie e definita ma non applicata:
+questa simulazione la rende attiva, quindi non equivale al controllo reale
+finche quest'ultimo non applica entrambe le serie con gli stessi parametri.
 
 Il viewer e attivo per default. Usa il display Linux del PC2; se ricompare
 l'errore GLFW/X11, seguire il paragrafo "Viewer X11" della sezione 5. Per una
 prima verifica del topic senza grafica si puo aggiungere
 `--headless --duration 10` allo stesso comando (sostituendo `--duration 0`).
 
-Il robot simulato parte dal keyframe `home` e resta fermo finche arriva la
-prima posa valida. Dopo, la sequenza e:
+Il robot simulato parte dal keyframe `home`. Come nel file reale, il `main`
+attende la prima posa camera valida prima di creare i tre collegamenti e
+aprire il viewer. Finche compare `[WAIT]`, non si e ancora entrati nel loop
+di controllo. Dopo, la sequenza e:
 
 1. Aggiornare i tre target dalla camera, con la stessa geometria di H2.
 2. Copiare q e dq del robot simulato nella copia virtuale ed eseguire `mj_forward`.
-3. Calcolare le coppie VMC, aggiungere il bias del modello dinamico e limitare
-   le coppie ai limiti dei giunti.
+3. Sommare le coppie VMC dei due meccanismi, aggiungere il bias del modello
+   dinamico e limitare le coppie ai limiti dei giunti.
 4. Eseguire `mj_step` sul robot simulato.
 5. Richiedere la chiusura simulata quando TCP e tre collegamenti restano entro
    1 cm per 0,5 s con una posa camera recente.
@@ -544,8 +560,11 @@ MuJoCo: questa versione verifica avvicinamento e chiusura, non il contatto o
 la qualita della presa. Inoltre la configurazione iniziale e la dinamica
 MuJoCo possono differire dal FR3 reale.
 
-Verifica locale: dinamica senza ROS e senza viewer, arrivo e chiusura con
-errore TCP finale di circa 2,4 mm per un target sintetico raggiungibile;
-verificati anche la conservazione dell'ultimo target dopo timeout e
-l'aggiornamento del target durante la chiusura. La ricezione ROS dalla Zivid
-e il viewer sul PC2 restano da verificare sul computer del laboratorio.
+Verifica locale: dinamica senza ROS e senza viewer, arrivo e chiusura per un
+target sintetico raggiungibile. Con la doppia serie attiva l'errore TCP finale
+era circa 0,72 mm; con `--stiffness2 0` circa 2,4 mm. Verificata la somma dei
+contributi dei due meccanismi senza azzeramento intermedio delle coppie.
+Nelle verifiche precedenti erano stati controllati anche la conservazione
+dell'ultimo target dopo timeout e l'aggiornamento del target durante la
+chiusura. La ricezione ROS dalla Zivid e il viewer sul PC2 restano da
+verificare sul computer del laboratorio.

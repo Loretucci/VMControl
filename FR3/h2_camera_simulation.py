@@ -1,31 +1,28 @@
-"""Use the real ArUco camera topic to control a simulated FR3 on PC2.
+"""Run the H2 workflow on PC2 using a real camera and a simulated FR3.
 
-The only application ROS endpoint is a PoseStamped subscriber. Arm torques
-and finger closure are applied directly to MuJoCo; no hardware command is
-published. The geometry helpers are imported from h2_simulations.py; importing
-that module does not run its main function or start its ROS bridge.
-
-As in the current real H2 controller, an old camera pose prevents a new close
-request but remains the VMC target. Targets also keep updating during closing.
-The simulated fingers closing is a visual test, not object-detection feedback.
+The structure and geometry helpers follow h2_vmc_ros.py: main() waits for the
+first camera pose, creates two sets of three connections, and runs step_iteration().
+Measured q,dq come from data_sim instead of PC1; torques are applied with
+mj_step instead of being published. The gripper closes only inside MuJoCo.
+There are no robot torque publishers or physical gripper command publishers.
 """
-
-from __future__ import annotations
 
 import argparse
 from contextlib import nullcontext
 from pathlib import Path
-from threading import Lock, Thread
 import time
+from threading import Lock
 
 import mujoco
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 from mujoco_vmc import (
     LinearDamper,
     MuJoCoSite,
     ObjectState,
     RobotStateSynchronizer,
+    StaticObject,
     TanhSpring,
     VirtualConnection,
     VirtualMechanism,
@@ -33,247 +30,184 @@ from mujoco_vmc import (
     draw_sphere,
     resolve_menagerie_path,
 )
-from h2_simulations import (
-    ARRIVAL_TIME,
-    CONNECTION_TOLERANCE,
-    GRIPPER_CLOSED_ANGLE,
-    POSITION_TOLERANCE,
-    build_ee_link_model,
-    build_positions,
-    new_target,
-)
+
+def build_ee_link_model(
+    spec,
+    link_length: float = 0.4,
+):
+    """Attach three virtual-force anchors rigidly to the gripper body.
+
+    These sites are added to MjSpec before compilation. Their coordinates are
+    local to robotiq_base_link; MuJoCo later computes their world positions
+    from the measured robot configuration. They do not add robot DOFs.
+    """
+    ee_spec = spec.body("robotiq_base_link")
+    tcp_site = spec.site("tcp")
+    tcp_pos = tcp_site.pos
+    L = float(link_length)
+
+    # The existing TCP is the point intended to meet the marker. The top and
+    # lateral sites supply distinct lever arms for the three force connections.
+    # In this gripper model, TCP +x is robotiq_base_link -y. The top site is
+    # displaced by -L along the gripper body's local z; the two lateral sites
+    # are displaced by +/-0.30 m along its local y.
+    ee_spec.add_site(name="ee_top_spring", pos=[tcp_pos[0], tcp_pos[1], tcp_pos[2] - L], size=[0.012, 0.0, 0.0], rgba=[1.0, 0.0, 0.0, 0.8], group=0)
+    ee_spec.add_site(name="gripper_left_finger", pos=[tcp_pos[0], tcp_pos[1] - 0.3, tcp_pos[2]], size=[0.012, 0.0, 0.0], rgba=[1.0, 0.0, 0.0, 0.8], group=0)
+    ee_spec.add_site(name="gripper_right_finger", pos=[tcp_pos[0], tcp_pos[1] + 0.3, tcp_pos[2]], size=[0.012, 0.0, 0.0], rgba=[1.0, 0.0, 0.0, 0.8], group=0)
+
+def build_positions(camera_pose, link_length):
+    """Build the three target points from one measured base-frame marker pose.
+
+    camera_pose contains (position, quaternion, receive_time). The position is
+    in metres in the FR3 base frame; the quaternion uses MuJoCo order wxyz.
+    The returned points are also in base/world coordinates, so they can be
+    compared directly with MuJoCo's site_xpos values.
+    """
+    L = float(link_length)
+    p_marker, q_marker, received_at = camera_pose
+
+    # Convert the marker orientation to a rotation matrix. Its columns are
+    # the marker's x, y and z axes expressed in the base frame.
+    rotation_flat = np.empty(9)
+    mujoco.mju_quat2Mat(rotation_flat, q_marker)  # MuJoCo quaternion order: w, x, y, z.
+    R_base_aruco = rotation_flat.reshape(3, 3)
+
+    x_aruco_in_base = R_base_aruco[:, 0]
+    z_aruco = R_base_aruco[:, 2]
+    # With h=0, the desired TCP coincides with the marker origin. The side
+    # targets lie along marker x and the top target along marker z.
+    h = 0.0
+    p_target = p_marker - h * z_aruco
+    p_left = p_target + 0.30 * x_aruco_in_base
+    p_right = p_target - 0.30 * x_aruco_in_base
+    # This is the position the upper gripper site is pulled toward.
+    p_top = p_target + L * z_aruco
+
+    return p_top,p_left,p_right, R_base_aruco
+
+def build_ref_objects(p_top,p_left,p_right,rotation_matrix):
+    """Represent the three target points as non-MuJoCo virtual objects.
+
+    StaticObject supplies position, orientation and zero linear velocity to
+    the virtual mechanism. The camera callback will update these targets
+    later; they are not physical bodies in the compiled robot model.
+    """
 
 
-class CameraPickSimulation:
-    """Keep the dynamic simulated plant separate from the virtual controller."""
+    # Their initial positions come from build_positions(). The target's
+    # orientation follows the detected marker, although the three connections
+    # below use only translational springs and dampers.
+    target_top_spring = StaticObject(ObjectState(position=p_top, rotation=rotation_matrix, linear_velocity=np.zeros(3)),name = "target_attachment_site")
+    target_l = StaticObject(ObjectState(position=p_left, rotation=rotation_matrix,linear_velocity=np.zeros(3)),name ="target_left_finger")
+    target_r = StaticObject(ObjectState(position=p_right, rotation=rotation_matrix,linear_velocity=np.zeros(3)),name = "target_right_finger")
+    return target_top_spring,target_l, target_r
 
-    def __init__(self, scene: Path, args: argparse.Namespace):
-        self.args = args
-        spec = mujoco.MjSpec.from_file(str(scene))
-        build_ee_link_model(spec, args.link_length)
-        self.model = spec.compile()
-        self.model.opt.timestep = args.timestep
-        self.model.opt.disableflags |= mujoco.mjtDisableBit.mjDSBL_ACTUATION
+def update_positions(p_top, p_left, p_right, rotation_matrix, target_top_spring, target_left, target_right):
+    """Move all virtual targets to the latest camera-derived positions.
 
-        # plant is the physical FR3 stand-in; virtual evaluates VMC at its q,dq.
-        # Only plant is advanced with mj_step. Neither state comes from PC1.
-        self.plant = mujoco.MjData(self.model)
-        self.virtual = mujoco.MjData(self.model)
-        key_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_KEY, args.initial_keyframe)
-        if key_id < 0:
-            raise ValueError(f"Unknown initial keyframe: {args.initial_keyframe}")
-        for data in (self.plant, self.virtual):
-            mujoco.mj_resetDataKeyframe(self.model, data, key_id)
-            mujoco.mj_forward(self.model, data)
+    The target velocity is currently set to zero on each update. Thus the
+    damper does not use an estimate of marker velocity between camera frames.
+    """
 
-        self.sync = RobotStateSynchronizer(self.model)
-        if self.sync.num_joints != 7:
-            raise ValueError("Expected exactly seven FR3 arm joints")
-        self.qpos_ids = np.asarray(self.sync.qpos_indices, dtype=int)
-        self.dof_ids = np.asarray(self.sync.qvel_indices, dtype=int)
-        self.torque_limits = self.model.jnt_actfrcrange[self.sync.joint_ids].copy()
-        if np.any(self.torque_limits[:, 0] >= self.torque_limits[:, 1]):
-            raise ValueError("The scene must define valid actuatorfrcrange limits for each FR3 joint")
+    target_left.set_state(ObjectState(position=p_left, rotation=rotation_matrix, linear_velocity=np.zeros(3)))
+    target_right.set_state(ObjectState(position=p_right, rotation=rotation_matrix, linear_velocity=np.zeros(3)))
+    target_top_spring.set_state(ObjectState(position=p_top, rotation=rotation_matrix, linear_velocity=np.zeros(3)))
 
-        self.tcp_id = self.model.site("tcp").id
-        self.site_ids = [self.model.site(name).id for name in (
-            "ee_top_spring", "gripper_left_finger", "gripper_right_finger",
-        )]
-        self.finger_qpos_id = self.model.jnt_qposadr[self.model.joint("finger_joint").id]
-        self.gripper_eq_id = self.model.equality("gripper_position").id
+def orientation_from_points(attachment, left, right):
+    """Reconstruct a right-handed frame from the three connection points.
 
-        # No placeholder targets: hold the home state until a valid pose arrives.
-        self.targets = None
-        self.mechanism = None
-        self.phase = "WAITING_TARGET"
-        self.last_camera_time = None
-        self.camera_recent = None
-        self.arrival_since = None
-        self.close_started = None
-        self.error_xyz = np.zeros(3)
-        self.connection_errors = np.zeros(3)
-        self.vmc_torques = np.zeros(7)
-
-    def update_target(self, camera_pose) -> None:
-        """Use the same marker axes, target offsets and zero target velocity as H2."""
-        position, quaternion, received_at = camera_pose
-        p_top, p_left, p_right, rotation = build_positions(
-            (position, quaternion), self.args.link_length,
-        )
-        positions = (p_top, p_left, p_right)
-        self.last_camera_time = received_at
-        if self.targets is None:
-            self.targets = [new_target(name, p, rotation) for name, p in zip(
-                ("target_attachment_site", "target_left_finger", "target_right_finger"),
-                positions,
-            )]
-            self.mechanism = VirtualMechanism([
-                VirtualConnection(
-                    source=MuJoCoSite(site_id, f"robot_anchor_{index}"),
-                    target=target,
-                    components=[
-                        TanhSpring(self.args.stiffness, max_force=self.args.max_force),
-                        LinearDamper(self.args.damping),
-                    ],
-                    name=f"camera_connection_{index}",
-                )
-                for index, (site_id, target) in enumerate(zip(self.site_ids, self.targets))
-            ])
-            self.phase = "APPROACH"
-            print(f"[CAMERA] First valid target: {np.round(position, 4)} m; phase=APPROACH")
-        else:
-            # All phases use new targets, including CLOSING/CLOSED, as in H2.
-            for target, p in zip(self.targets, positions):
-                target.set_state(ObjectState(
-                    position=p, rotation=rotation, linear_velocity=np.zeros(3),
-                ))
-
-    def step(self, now: float, camera_pose=None) -> None:
-        """Consume at most one pose and advance only the simulated robot."""
-        if camera_pose is not None:
-            self.update_target(camera_pose)
-        if self.targets is None:
-            return
-
-        mujoco.mj_forward(self.model, self.plant)
-        self.sync.set_state(
-            self.virtual, self.plant.qpos[self.qpos_ids], self.plant.qvel[self.dof_ids],
-            forward=True,
-        )
-        target_positions = [target.state(self.model, self.virtual).position for target in self.targets]
-        target_tcp = (target_positions[1] + target_positions[2]) / 2.0
-        self.error_xyz = target_tcp - self.virtual.site_xpos[self.tcp_id]
-        self.connection_errors = np.array([
-            np.linalg.norm(p - self.virtual.site_xpos[site_id])
-            for p, site_id in zip(target_positions, self.site_ids)
-        ])
-
-        # Camera freshness uses local wall time, just like the real H2 script.
-        # In particular, expiry does NOT remove the last target or zero VMC.
-        camera_recent = now - self.last_camera_time <= self.args.camera_timeout
-        if camera_recent != self.camera_recent:
-            if not camera_recent:
-                print("[CAMERA] Pose timed out: keeping the last VMC target; new closing is inhibited")
-            elif self.camera_recent is False:
-                print("[CAMERA] Fresh camera poses resumed")
-            self.camera_recent = camera_recent
-
-        within_tolerance = (
-            np.linalg.norm(self.error_xyz) < POSITION_TOLERANCE
-            and np.max(self.connection_errors) < CONNECTION_TOLERANCE
-        )
-        if self.phase == "APPROACH":
-            if within_tolerance and camera_recent:
-                if self.arrival_since is None:
-                    self.arrival_since = now
-                    print("[ARRIVAL] Conditions satisfied; starting 0.5 s timer")
-                elif now - self.arrival_since >= ARRIVAL_TIME:
-                    self.phase = "CLOSING"
-                    self.close_started = now
-                    self.arrival_since = None
-                    print("[GRIPPER] CLOSING: closing only the MuJoCo fingers")
-            else:
-                if self.arrival_since is not None:
-                    print(f"[ARRIVAL] Timer cancelled: within_tolerance={within_tolerance}, camera_recent={camera_recent}")
-                self.arrival_since = None
-
-        # The XML's gripper_position equality supplies a simulated finger target.
-        # This is a visual closing test, not a simulated grasp of a physical object.
-        if self.phase == "CLOSING":
-            elapsed = now - self.close_started
-            fraction = min(elapsed / self.args.close_time, 1.0)
-            self.model.eq_data[self.gripper_eq_id, 0] = GRIPPER_CLOSED_ANGLE * fraction
-            if fraction >= 1.0 and abs(self.plant.qpos[self.finger_qpos_id] - GRIPPER_CLOSED_ANGLE) < 0.02:
-                self.phase = "CLOSED"
-                print("[GRIPPER] CLOSED: simulated fingers closed; no object-detection feedback")
-            elif elapsed >= self.args.close_time + 5.0:
-                self.phase = "FAILED"
-                print("[GRIPPER] FAILED: simulated fingers did not reach the closing angle")
-
-        self.virtual.qfrc_applied[:] = 0.0
-        self.mechanism.apply(self.model, self.virtual)
-        self.vmc_torques = self.virtual.qfrc_applied[self.dof_ids].copy()
-        if not np.all(np.isfinite(self.vmc_torques)):
-            raise RuntimeError("Non-finite VMC torques; stopping simulation")
-        # Bias compensation and final clipping belong to the simulated plant.
-        # These torques are never placed in a ROS publisher or sent to hardware.
-        self.plant.qfrc_applied[:] = 0.0
-        self.plant.qfrc_applied[self.dof_ids] = np.clip(
-            self.vmc_torques + self.plant.qfrc_bias[self.dof_ids],
-            self.torque_limits[:, 0], self.torque_limits[:, 1],
-        )
-        mujoco.mj_step(self.model, self.plant)
-
-    def draw(self, scene) -> None:
-        """Show the measured target and three virtual connections in the viewer."""
-        scene.ngeom = 0
-        if self.targets is None:
-            return
-        positions = [target.state(self.model, self.virtual).position for target in self.targets]
-        draw_sphere(scene, (positions[1] + positions[2]) / 2.0, radius=0.018, rgba=[1.0, 0.8, 0.1, 0.9])
-        for site_id, p, color in zip(self.site_ids, positions, (
-            [0.1, 0.9, 1.0, 0.8], [0.4, 1.0, 0.4, 0.8], [1.0, 0.4, 0.7, 0.8],
-        )):
-            draw_sphere(scene, p, radius=0.012, rgba=color)
-            draw_capsule_line(scene, self.plant.site_xpos[site_id], p, radius=0.003, rgba=color)
-
-    def log_status(self, now: float) -> None:
-        """Called once per second, independently of new camera observations."""
-        if self.targets is None:
-            print("[WAIT] Waiting for the first valid base-frame camera pose; simulated robot held at home")
-            return
-        dwell = 0.0 if self.arrival_since is None else now - self.arrival_since
-        print(
-            f"[SIM] phase={self.phase}; sim_time={self.plant.time:.2f}s; "
-            f"TCP error={np.round(self.error_xyz, 4)} m; "
-            f"links={np.round(self.connection_errors, 4)} m; "
-            f"camera_age={now - self.last_camera_time:.2f}s; arrival={dwell:.2f}s; "
-            f"max_abs_tau={np.max(np.abs(self.vmc_torques)):.2f} Nm"
-        )
+    x points from right to left. z points from the top point toward the
+    midpoint of the lateral points, after removing any x component. y=z cross
+    x completes the orthogonal frame. Each returned column is a frame axis
+    expressed in world/base coordinates.
+    """
+    x_axis = np.asarray(left, dtype=float) - right
+    x_axis /= np.linalg.norm(x_axis)
+    z_axis = (np.asarray(left, dtype=float) + right) / 2.0 - attachment
+    z_axis -= np.dot(z_axis, x_axis) * x_axis
+    z_axis /= np.linalg.norm(z_axis)
+    y_axis = np.cross(z_axis, x_axis)
+    return np.column_stack((x_axis, y_axis, z_axis))
 
 
-def parse_args():
+def main():
+    # ROS is needed only when running main. The geometry helpers remain usable
+    # for local headless checks on a Mac without a ROS installation.
+    from geometry_msgs.msg import PoseStamped
+    from mujoco_vmc.utils.ros import RobotROSBridge
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--scene", type=Path, help="combined scene XML; otherwise use MUJOCO_MENAGERIE_PATH")
     parser.add_argument("--camera-topic", default="/vision/aruco_pose")
     parser.add_argument("--camera-timeout", type=float, default=0.8)
     parser.add_argument("--initial-keyframe", default="home")
     parser.add_argument("--stiffness", type=float, default=600.0)
+    parser.add_argument("--stiffness2", type=float, default=2000.0,
+                        help="second parallel spring stiffness for each endpoint (N/m)")
     parser.add_argument("--damping", type=float, default=30.0)
     parser.add_argument("--max-force", type=float, default=10.0)
+    parser.add_argument("--max-force2", type=float, default=20.0,
+                        help="second parallel spring force limit per axis (N)")
     parser.add_argument("--link-length", type=float, default=0.4)
     parser.add_argument("--timestep", type=float, default=0.001)
     parser.add_argument("--close-time", type=float, default=1.0)
     parser.add_argument("--headless", action="store_true")
-    parser.add_argument("--duration", type=float, default=0.0, help="wall-clock seconds, including the initial wait; <=0 runs until stopped")
+    parser.add_argument("--duration", type=float, default=0.0,
+                        help="wall-clock seconds after initialization; <=0 runs until stopped")
     args = parser.parse_args()
-    values = (args.stiffness, args.damping, args.max_force, args.link_length,
-              args.timestep, args.close_time, args.camera_timeout, args.duration)
+    values = (args.stiffness, args.stiffness2, args.damping, args.max_force,
+              args.max_force2, args.link_length, args.timestep, args.close_time,
+              args.camera_timeout, args.duration)
     if not np.all(np.isfinite(values)):
         parser.error("numeric arguments must be finite")
-    if args.stiffness < 0 or args.damping < 0:
-        parser.error("stiffness and damping must be nonnegative")
-    if min(args.max_force, args.link_length, args.timestep, args.close_time, args.camera_timeout) <= 0:
-        parser.error("max-force, link-length, timestep, close-time and camera-timeout must be positive")
-    return args
+    if args.stiffness < 0 or args.stiffness2 < 0 or args.damping < 0:
+        parser.error("stiffness, stiffness2 and damping must be nonnegative")
+    if min(args.max_force, args.max_force2, args.link_length, args.timestep, args.close_time, args.camera_timeout) <= 0:
+        parser.error("max-force, max-force2, link-length, timestep, close-time and camera-timeout must be positive")
 
+    phase = "APPROACH"
+    position_tolerance = 0.01
+    connection_tolerance = 0.01
 
-def main() -> None:
-    args = parse_args()
-    scene = (args.scene.expanduser().resolve() if args.scene is not None else
-             resolve_menagerie_path() / "fr3_robotiq_2f_140" / "scene_fr3_robotiq.xml")
-    if not scene.is_file():
-        raise FileNotFoundError(f"Scene not found: {scene}; pass --scene with its actual path")
-    simulation = CameraPickSimulation(scene, args)
+    # --- Load the robot and create the two states ---
+    scene_xml = (args.scene.expanduser().resolve() if args.scene is not None else
+                 resolve_menagerie_path() / "fr3_robotiq_2f_140" / "scene_fr3_robotiq.xml")
+    if not scene_xml.is_file():
+        raise FileNotFoundError(f"Scene not found: {scene_xml}; pass --scene with its actual path")
+    spec = mujoco.MjSpec.from_file(str(scene_xml))
+    build_ee_link_model(spec, args.link_length)
+    model = spec.compile()
+    model.opt.disableflags |= mujoco.mjtDisableBit.mjDSBL_ACTUATION
+    model.opt.timestep = args.timestep
 
-    # ROS exists only at this boundary. Keeping it out of the physics class also
-    # allows local headless dynamics checks when rclpy is not installed on a Mac.
-    import rclpy
-    from geometry_msgs.msg import PoseStamped
-    from rclpy.executors import ExternalShutdownException
+    # data keeps its H2 meaning: the virtual model used to calculate VMC.
+    # data_sim is the additional dynamic state that replaces the physical FR3.
+    data = mujoco.MjData(model)
+    data_sim = mujoco.MjData(model)
+    sync = RobotStateSynchronizer(model)
+    if sync.num_joints != 7:
+        raise ValueError("Expected exactly seven FR3 arm joints")
+    qpos_ids = np.asarray(sync.qpos_indices, dtype=int)
+    dof_ids = np.asarray(sync.qvel_indices, dtype=int)
+    torque_limits = model.jnt_actfrcrange[sync.joint_ids].copy()
+    if np.any(torque_limits[:, 0] >= torque_limits[:, 1]):
+        raise ValueError("The scene must define valid actuatorfrcrange limits for each FR3 joint")
 
-    rclpy.init()
-    node = rclpy.create_node("h2_camera_simulation")
+    key_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, args.initial_keyframe)
+    if key_id < 0:
+        raise ValueError(f"Unknown initial keyframe: {args.initial_keyframe}")
+    mujoco.mj_resetDataKeyframe(model, data_sim, key_id)
+    mujoco.mj_resetDataKeyframe(model, data, key_id)
+    mujoco.mj_forward(model, data_sim)
+    sync.set_state(data, data_sim.qpos[qpos_ids], data_sim.qvel[dof_ids], forward=True)
+    finger_qpos_id = model.jnt_qposadr[model.joint("finger_joint").id]
+    gripper_eq_id = model.equality("gripper_position").id
+
+    # --- ROS callback and subscriber: same pattern as real H2 ---
+    # The bridge runs the ROS executor only. Without sub_topic/pub_*_topic,
+    # it neither subscribes to PC1 states nor creates command publishers.
+    bridge = RobotROSBridge(synchronizer=sync, node_name="h2_camera_simulation")
+    bridge.start()
     camera_lock = Lock()
     latest_camera_pose = None
 
@@ -281,60 +215,271 @@ def main() -> None:
         nonlocal latest_camera_pose
         if msg.header.frame_id != "base":
             return
-        p = np.array([msg.pose.position.x, msg.pose.position.y, msg.pose.position.z])
+        p = np.array([msg.pose.position.x, msg.pose.position.y, msg.pose.position.z], dtype=float)
         q = np.array([msg.pose.orientation.w, msg.pose.orientation.x,
-                      msg.pose.orientation.y, msg.pose.orientation.z])
+                      msg.pose.orientation.y, msg.pose.orientation.z], dtype=float)
         norm = np.linalg.norm(q)
         if not np.all(np.isfinite(p)) or not np.all(np.isfinite(q)) or not np.isfinite(norm) or norm < 1e-6:
             return
         with camera_lock:
             latest_camera_pose = (p, q / norm, time.perf_counter())
 
-    camera_sub = node.create_subscription(PoseStamped, args.camera_topic, camera_callback, 1)
-
-    def spin_ros():
-        try:
-            rclpy.spin(node)
-        except (ExternalShutdownException, KeyboardInterrupt):
-            pass
-
-    ros_thread = Thread(target=spin_ros, daemon=True)
-    ros_thread.start()
-    print(f"[SIM] Scene: {scene}")
-    print(f"[ROS] Camera input: {args.camera_topic}; required frame_id=base")
-    print("[SIM] Arm motion and finger closing are local MuJoCo operations; no hardware commands are published")
-    t_start = time.perf_counter()
-    next_tick = t_start
-    next_render = t_start
-    next_log = t_start
     try:
+        if bridge.node is None:
+            raise RuntimeError("The ROS bridge did not start")
+        camera_sub = bridge.node.create_subscription(PoseStamped, args.camera_topic, camera_callback, 1)
+        print(f"[SIM] Scene: {scene_xml}")
+        print(f"[ROS] Camera input: {args.camera_topic}; required frame_id=base")
+        print("[SIM] Arm torques and finger closure stay inside MuJoCo; no hardware commands are published")
+
+        # --- Wait for the first target, then build the mechanism outside the loop ---
+        # As in h2_vmc_ros.py, there are no placeholder target coordinates.
+        # The viewer opens only after this first valid camera observation.
+        first_camera_pose = None
+        print("[WAIT] Waiting for the first valid base-frame camera pose")
+        while first_camera_pose is None:
+            with camera_lock:
+                first_camera_pose = latest_camera_pose
+            if first_camera_pose is None:
+                time.sleep(0.05)
+        print(f"[CAMERA] First valid target: {np.round(first_camera_pose[0], 4)} m")
+
+        target_top_position, target_left_position, target_right_position, R_base_aruco = build_positions(
+            first_camera_pose, args.link_length,
+        )
+        target_top_spring, target_left, target_right = build_ref_objects(
+            target_top_position, target_left_position, target_right_position, R_base_aruco,
+        )
+        tcp_id = model.site("tcp").id
+        top_spring_id = model.site("ee_top_spring").id
+        left_grip_id = model.site("gripper_left_finger").id
+        right_grip_id = model.site("gripper_right_finger").id
+        r_top_site = MuJoCoSite(top_spring_id, "top_site")
+        r_left_site = MuJoCoSite(left_grip_id, "left_finger")
+        r_right_site = MuJoCoSite(right_grip_id, "right_finger")
+
+        # The first three connections contain a spring and a damper.
+        conn_att = VirtualConnection(
+            source=r_top_site,
+            target=target_top_spring,
+            components=[
+                TanhSpring(args.stiffness, max_force=args.max_force),
+                LinearDamper(args.damping),
+            ],
+            name="link_att_spring",
+        )
+        conn_left = VirtualConnection(
+            source=r_left_site,
+            target=target_left,
+            components=[
+                TanhSpring(args.stiffness, max_force=args.max_force),
+                LinearDamper(args.damping),
+            ],
+            name="link_left_spring",
+        )
+        conn_right = VirtualConnection(
+            source=r_right_site,
+            target=target_right,
+            components=[
+                TanhSpring(args.stiffness, max_force=args.max_force),
+                LinearDamper(args.damping),
+            ],
+            name="link_right_spring",
+        )
+        # A second spring acts in parallel between the same endpoints. Omitting
+        # the damper means no second damping contribution; 0 is not a component.
+        conn_att_2 = VirtualConnection(
+            source=r_top_site,
+            target=target_top_spring,
+            components=[
+                TanhSpring(args.stiffness2, max_force=args.max_force2),
+            ],
+            name="link_att_spring_2",
+        )
+        conn_left_2 = VirtualConnection(
+            source=r_left_site,
+            target=target_left,
+            components=[
+                TanhSpring(args.stiffness2, max_force=args.max_force2),
+            ],
+            name="link_left_spring_2",
+        )
+        conn_right_2 = VirtualConnection(
+            source=r_right_site,
+            target=target_right,
+            components=[
+                TanhSpring(args.stiffness2, max_force=args.max_force2),
+            ],
+            name="link_right_spring_2",
+        )
+        mechanism = VirtualMechanism([conn_att, conn_left, conn_right])
+        mechanism_2 = VirtualMechanism([conn_att_2, conn_left_2, conn_right_2])
+
+        mujoco.mj_forward(model, data)
+        last_telemetry_log = time.time()
+        t_arrival = None
+        last_camera_time = first_camera_pose[2]
+        camera_timeout = args.camera_timeout
+        camera_was_recent = None
+        closing_timeout = 5.0
+        t_close_request = None
+        dt = model.opt.timestep
+
+        def step_iteration():
+            nonlocal latest_camera_pose, last_camera_time, last_telemetry_log
+            nonlocal t_arrival, phase, camera_was_recent
+
+            # H2 gets q,dq from bridge.apply_incoming_state(). Here the same
+            # synchronizer copies q,dq from the locally simulated FR3 instead.
+            mujoco.mj_forward(model, data_sim)
+            sync.set_state(data, data_sim.qpos[qpos_ids], data_sim.qvel[dof_ids], forward=True)
+            with camera_lock:
+                camera_pose = latest_camera_pose
+                latest_camera_pose = None
+            if camera_pose is not None:
+                last_camera_time = camera_pose[2]
+                new_p_top, new_p_left, new_p_right, new_rotation = build_positions(camera_pose, args.link_length)
+                update_positions(new_p_top, new_p_left, new_p_right, new_rotation,
+                                 target_top_spring, target_left, target_right)
+
+            # --- Same target/error calculations as H2 ---
+            target_att_pos = target_top_spring.state(model, data).position
+            target_left_pos = target_left.state(model, data).position
+            target_right_pos = target_right.state(model, data).position
+            desired_tip_pos = (target_left_pos + target_right_pos) / 2.0
+            error_xyz = desired_tip_pos - data.site_xpos[tcp_id]
+            connection_errors = [
+                np.linalg.norm(target_att_pos - data.site_xpos[top_spring_id]),
+                np.linalg.norm(target_left_pos - data.site_xpos[left_grip_id]),
+                np.linalg.norm(target_right_pos - data.site_xpos[right_grip_id]),
+            ]
+            target_rotation = orientation_from_points(target_att_pos, target_left_pos, target_right_pos)
+            measured_rotation = orientation_from_points(
+                data.site_xpos[top_spring_id], data.site_xpos[left_grip_id], data.site_xpos[right_grip_id],
+            )
+
+            within_tolerance = (
+                np.linalg.norm(error_xyz) < position_tolerance
+                and max(connection_errors) < connection_tolerance
+            )
+            close_requested = False
+            t_actual = time.perf_counter()
+            # The plant state is copied on every iteration, so it has no ROS
+            # reception timeout. This version does not test PC1 connection loss.
+            robot_state_recent = True
+            camera_data_recent = t_actual - last_camera_time <= camera_timeout
+            if camera_data_recent != camera_was_recent:
+                if not camera_data_recent:
+                    print("[CAMERA] Pose timed out: keeping the last VMC target; new closing is inhibited")
+                elif camera_was_recent is False:
+                    print("[CAMERA] Fresh camera poses resumed")
+                camera_was_recent = camera_data_recent
+
+            # --- Same APPROACH -> CLOSING decision and 0.5 s dwell as H2 ---
+            if phase == "APPROACH":
+                if within_tolerance and robot_state_recent and camera_data_recent:
+                    if t_arrival is None:
+                        t_arrival = t_actual
+                        print("[ARRIVAL] Conditions satisfied; starting 0.5 s timer")
+                    elif t_actual - t_arrival >= 0.5:
+                        phase = "CLOSING"
+                        close_requested = True
+                        t_arrival = None
+                else:
+                    if t_arrival is not None:
+                        print(f"[ARRIVAL] Timer cancelled: within_tolerance={within_tolerance}, camera_recent={camera_data_recent}")
+                    t_arrival = None
+
+            # H2 checks real gripper feedback here. The local visual substitute
+            # ramps the existing gripper_position equality to a closing angle.
+            # CLOSED means only that this angle was reached, not a grasped object.
+            if phase == "CLOSING" and t_close_request is not None:
+                elapsed = t_actual - t_close_request
+                fraction = min(elapsed / args.close_time, 1.0)
+                model.eq_data[gripper_eq_id, 0] = 0.7 * fraction
+                if fraction >= 1.0 and abs(data_sim.qpos[finger_qpos_id] - 0.7) < 0.02:
+                    phase = "CLOSED"
+                    print("[GRIPPER] CLOSED: simulated fingers closed; no object-detection feedback")
+                elif elapsed >= closing_timeout:
+                    phase = "FAILED"
+                    print("[GRIPPER] FAILED: simulated fingers did not reach the closing angle")
+
+            # Apply both parallel mechanisms. Each apply adds its joint forces
+            # to qfrc_applied, so clear it once before the two evaluations.
+            data.qfrc_applied[:] = 0.0
+            mechanism.apply(model, data)
+            mechanism_2.apply(model, data)
+            vmc_torques = np.array([data.qfrc_applied[adr] for adr in sync.qvel_indices], dtype=float)
+            if not np.all(np.isfinite(vmc_torques)):
+                raise RuntimeError("Non-finite VMC torques; stopping simulation")
+            required_torques = vmc_torques
+
+            # H2 calls bridge.publish(data, torques=required_torques) here.
+            # Instead, compensate the local plant bias, clip its joint torques,
+            # and integrate only data_sim. Nothing is published to the hardware.
+            data_sim.qfrc_applied[:] = 0.0
+            data_sim.qfrc_applied[dof_ids] = np.clip(
+                required_torques + data_sim.qfrc_bias[dof_ids],
+                torque_limits[:, 0], torque_limits[:, 1],
+            )
+            mujoco.mj_step(model, data_sim)
+
+            if time.time() - last_telemetry_log > 1.0:
+                orientation_error_xyz_deg = -np.degrees(
+                    Rotation.from_matrix(target_rotation.T @ measured_rotation).as_rotvec()
+                )
+                dwell = 0.0 if t_arrival is None else t_actual - t_arrival
+                print(
+                    f"[SIM] phase={phase}; sim_time={data_sim.time:.2f}s; "
+                    f"TCP error={np.round(error_xyz, 4)} m; "
+                    f"connections={np.round(connection_errors, 4)} m; "
+                    f"orientation error={np.round(orientation_error_xyz_deg, 2)} deg; "
+                    f"camera_age={t_actual - last_camera_time:.2f}s; arrival={dwell:.2f}s; "
+                    f"max_abs_tau={np.max(np.abs(vmc_torques)):.2f} Nm"
+                )
+                last_telemetry_log = time.time()
+            return close_requested
+
+        # --- Same paced outer loop and one-shot close request pattern as H2 ---
+        # Only the action taken for a close request is local to MuJoCo.
+        t_start = time.perf_counter()
+        next_tick = t_start
+        next_viewer_sync = t_start
         context = nullcontext(None)
         if not args.headless:
             from mujoco import viewer
-            context = viewer.launch_passive(simulation.model, simulation.plant)
+            context = viewer.launch_passive(model, data_sim)
         with context as v:
             if v is not None:
                 v.cam.lookat[:] = [0.4, 0.0, 0.5]
                 v.cam.distance = 2.0
                 v.cam.azimuth = 135.0
                 v.cam.elevation = -20.0
-            while rclpy.ok() and (v is None or v.is_running()):
+            while (v is None or v.is_running()) and (args.duration <= 0 or time.perf_counter() - t_start < args.duration):
+                close_request = step_iteration()
+                if close_request:
+                    # Real H2 publishes Float64(0.001) to /hand/finger_distance.
+                    # This timestamp instead starts the local finger-angle ramp.
+                    t_close_request = time.perf_counter()
+                    print("[GRIPPER] CLOSING: closing only the MuJoCo fingers")
                 now = time.perf_counter()
-                if args.duration > 0 and now - t_start >= args.duration:
-                    break
-                with camera_lock:
-                    camera_pose = latest_camera_pose
-                    latest_camera_pose = None
-                simulation.step(now, camera_pose)
-                if now >= next_log:
-                    simulation.log_status(now)
-                    next_log = now + 1.0
-                if v is not None and now >= next_render:
+                if v is not None and now >= next_viewer_sync:
                     with v.lock():
-                        simulation.draw(v.user_scn)
+                        v.user_scn.ngeom = 0
+                        target_tcp = (target_left.state(model, data).position + target_right.state(model, data).position) / 2.0
+                        draw_sphere(v.user_scn, target_tcp, radius=0.018, rgba=[1.0, 0.8, 0.1, 0.9])
+                        for source_id, target, color in (
+                            (top_spring_id, target_top_spring, [0.1, 0.9, 1.0, 0.8]),
+                            (left_grip_id, target_left, [0.4, 1.0, 0.4, 0.8]),
+                            (right_grip_id, target_right, [1.0, 0.4, 0.7, 0.8]),
+                        ):
+                            target_pos = target.state(model, data).position
+                            draw_sphere(v.user_scn, target_pos, radius=0.012, rgba=color)
+                            draw_capsule_line(v.user_scn, data_sim.site_xpos[source_id], target_pos,
+                                              radius=0.003, rgba=color)
                     v.sync()
-                    next_render = now + 1.0 / 30.0
-                next_tick += args.timestep
+                    next_viewer_sync = now + 1.0 / 30.0
+                next_tick += dt
                 remaining = next_tick - time.perf_counter()
                 if remaining > 0:
                     time.sleep(remaining)
@@ -345,10 +490,7 @@ def main() -> None:
     except KeyboardInterrupt:
         print("\n[SIM] Interrupted")
     finally:
-        if rclpy.ok():
-            rclpy.shutdown()
-        ros_thread.join(timeout=2.0)
-        node.destroy_node()
+        bridge.stop()
 
 
 if __name__ == "__main__":

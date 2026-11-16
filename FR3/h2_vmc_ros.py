@@ -357,8 +357,7 @@ def main():
         source=r_top_site,
         target=target_top_spring,
         components=[
-            TanhSpring(args.stiffness, max_force=args.max_force),
-            0,
+            TanhSpring(args.stiffness2, max_force=args.max_force2),
         ],
         name="link_att_spring",
     )
@@ -366,8 +365,7 @@ def main():
         source=r_left_site,
         target=target_left,
         components=[
-            TanhSpring(args.stiffness, max_force=args.max_force),
-            0,
+            TanhSpring(args.stiffness2, max_force=args.max_force2),
         ],
         name="link_left_spring",
     )
@@ -375,8 +373,7 @@ def main():
         source=r_right_site,
         target=target_right,
         components=[
-            TanhSpring(args.stiffness, max_force=args.max_force),
-            0,
+            TanhSpring(args.stiffness2, max_force=args.max_force2),
         ],
         name="link_right_spring",
     )
@@ -551,6 +548,7 @@ def main():
         # Python timeout does not replace a watchdog in the robot controller.
         if time.perf_counter() - last_state_time <= args.state_timeout:
             mechanism.apply(model, data)
+            mechanism_2.apply(model, data)
             vmc_torques = np.array([data.qfrc_applied[adr] for adr in sync.qvel_indices], dtype=float)
         else:
             vmc_torques = np.zeros(sync.num_joints)
