@@ -6,13 +6,13 @@ sull'host del PC2, e `h2_vmc_ros.py` nella shell VMC del PC2. La sequenza è:
 attivazione/calibrazione e apertura quando parte il suo nodo; H2 va avviato
 soltanto dopo che l'apertura è terminata.
 
-Stato verificato il 13 novembre 2026: sul PC2 sono stati caricati i launch del
-commit `0d522f6`; il venv host `~/venvs/vmc` importa PyModbus 3.16.2; i file
-settings e calibrazione Zivid esistono; il modello FR3 + Robotiq è stato
-compilato **nel container** con `nq=13`, `nv=13`, `nu=7`. Non risulta ancora una
-prova integrata di H2 con il nuovo `torque_subscriber_controller`. Il nuovo
-nome del controller è stato comunicato da Lorenzo; **il topic esatto delle
-coppie va verificato sul PC1 prima della prova reale**. Il vecchio
+Stato al 13 novembre 2026: il modello FR3 + Robotiq è stato compilato **nel
+container** con `nq=13`, `nv=13`, `nu=7`. È stato tentato il launch reale con
+`/robot1`, dominio ROS 42, `stiffness=600`, `damping=30`, `max_force=10` e viewer
+attivo. Il log disponibile mostra che il processo è terminato perché X11 ha
+rifiutato l'accesso al display `:0`; Lorenzo riferisce che la prova non ha
+ancora funzionato bene. Il topic delle coppie va verificato sul PC1 prima di
+ogni nuovo avvio reale. Il vecchio
 [lorenzoreadme.md](lorenzoreadme.md) descrive H1 con
 `julia_torque_controller`: è una prova storica, non il comando H2 da copiare.
 
@@ -85,14 +85,6 @@ ros2 control list_controllers
 ros2 topic list -t | grep -E 'joint_states|torque|external'
 ```
 
-Se il bringup non è già avviato, il **vecchio** comando aveva questa forma:
-
-```bash
-ros2 launch franka_bringup example.launch.py \
-  controller_name:=julia_torque_controller \
-  robot_config_file:=/ros2_ws/src/franka_bringup/config/franka_yi.config.yaml
-```
-
 Per H2 Lorenzo ha comunicato il nuovo nome `torque_subscriber_controller`.
 Prima di avviarlo, verificare che il controller sia installato e configurato
 nel YAML attuale del PC1. Se il bringup e il file di configurazione sono
@@ -108,23 +100,23 @@ ros2 launch franka_bringup example.launch.py \
 sessione.** Usare quello effettivamente valido sul PC1 se il laboratorio lo ha
 cambiato. Lasciare aperto il terminale del bringup.
 
-Verificare che `/robot2/franka/joint_states` pubblichi `JointState`. Individuare
-il topic sottoscritto dal **nuovo** controller per le sette coppie, senza
-dedurlo soltanto dal nome:
+Verificare che `/robot1/franka/joint_states` pubblichi `JointState` e che il
+controller sottoscriva il topic delle sette coppie usato nel launch H2:
 
 ```bash
 ros2 topic list -t | grep -E 'joint_states|torque|external'
 ros2 control list_controllers
+ros2 topic info /robot1/franka/joint_states --verbose
+ros2 topic info /robot1/torque_subscriber_controller/external_torques --verbose
 ```
 
-Un possibile nome, da **verificare**, è
-`/robot2/torque_subscriber_controller/external_torques`. Per il topic
-individuato usare `ros2 topic info NOME_TOPIC --verbose`: ci aspettiamo tipo
-`std_msgs/msg/Float64MultiArray`, un subscriber del controller e nessun
-publisher H2 prima della prova reale. Annotare il nome esatto come
-`REAL_TORQUE_TOPIC`. Il vecchio topic
-`/robot2/julia_torque_controller/external_torques` appartiene alla
-configurazione H1 documentata in precedenza.
+Per il topic delle coppie ci aspettiamo tipo `std_msgs/msg/Float64MultiArray`
+e un subscriber del `torque_subscriber_controller`. Il percorso nel comando H2
+è quello usato nel tentativo del 13 novembre, ma non abbiamo ancora un output
+di `topic info` che ne confermi il subscriber. Se compare `Unknown topic` o
+nessun subscriber del controller, identificare il topic effettivo sul PC1
+prima di avviare H2. Il vecchio topic di `julia_torque_controller` appartiene
+alla configurazione H1.
 
 Il controller PC1 deve essere pronto **prima** di H2: H2 attende un
 `JointState` reale per inizializzare la copia virtuale. H2 non aggiunge una
@@ -279,7 +271,7 @@ esiste più. Non impostare `--net` nel comando `nsenter`, altrimenti la rete non
 Prima del VMC, verificare **da questa shell** che arrivino gli input:
 
 ```bash
-ros2 topic echo /robot2/franka/joint_states --once
+ros2 topic echo /robot1/franka/joint_states --once
 ros2 topic echo /vision/aruco_pose --once
 ```
 
@@ -289,136 +281,121 @@ problema lanciando una seconda istanza H2.
 
 ### Viewer X11
 
-Il viewer viene aperto da H2 nella stessa shell. Verificare `echo "$DISPLAY"`
-qui e in un terminale host; se nella shell `nsenter` manca, esportare il valore
-effettivo dell'host. Solo se compare un errore X11 di autorizzazione, da
-terminale host dell'utente grafico eseguire:
+Il tentativo del 13 novembre ha mostrato `X11: Failed to open display :0`.
+Prima di rilanciare H2 con il viewer, aprire un **terminale del desktop del
+PC2 come utente `lorenzoantonio`**, non la shell root `nsenter`, ed eseguire:
 
 ```bash
+echo "$DISPLAY"
 xhost +SI:localuser:root
 ```
 
-Al termine del viewer revocare con `xhost -SI:localuser:root`. Il vecchio
+Nella shell `nsenter` verificare `echo "$DISPLAY"`: deve indicare lo stesso
+display (nel log era `:0`). Se è vuoto e il display host è `:0`, eseguire lì
+`export DISPLAY=:0`. Il comando `xhost` è una prova di accesso, non una
+conferma che il viewer ora funzioni: se ricompare un errore GLFW/X11,
+diagnosticare il display prima di considerare riuscito l'avvio. Al termine
+revocare l'accesso dal terminale host con `xhost -SI:localuser:root`. Il vecchio
 [README, sezione viewer](lorenzoreadme.md#9-viewer-integrato) contiene il
 contesto della precedente prova.
 
-## 6. Avviare H2 con le coppie isolate
+## 6. PC2 — avviare H2 sul robot reale
 
-Nella shell `nsenter`, dopo PC1, gripper e camera, avviare H2. Il topic delle
-coppie nel launch è di default `/vmc/h2_dry_run_torques`, non quello del
-controller reale:
-
-```bash
-ros2 launch /workspace/VMControl/FR3/h2_vmc.launch.py \
-  start_h2:=true \
-  python_executable:=/opt/venv/bin/python \
-  sub_topic:=/robot2/franka/joint_states \
-  camera_topic:=/vision/aruco_pose \
-  torque_pub_topic:=/vmc/h2_dry_run_torques \
-  duration:=0
-```
-
-`duration:=0` significa ciclo continuo e `headless:=false` (default) apre il
-viewer. H2 attende una prima posa camera valida e un primo `JointState`, poi
-crea i tre collegamenti virtuali. A ogni aggiornamento usa lo stato reale
-misurato, calcola le coppie nel modello virtuale e le passa al bridge ROS.
-Non chiama `mj_step` per far evolvere un secondo robot dinamico.
-
-**Questa prova isola solo le coppie del braccio.** Se il nodo gripper è in
-esecuzione, H2 può pubblicare una richiesta reale di chiusura su
-`/hand/finger_distance` quando le condizioni di presa sono soddisfatte. Il
-codice richiede per 0,5 s un errore TCP e un massimo sui tre collegamenti
-inferiori a 1 cm, con dati robot e camera recenti. Il timeout robot predefinito
-è 0,2 s; quello camera nel codice è 0,8 s.
-
-Da terminale host, senza usare `topic echo` sul topic delle coppie durante
-questa verifica (echo aggiungerebbe un subscriber diagnostico):
-
-```bash
-ros2 topic info /vmc/h2_dry_run_torques --verbose
-ros2 topic list -t | grep -E 'joint_states|torque|external'
-```
-
-Il topic dry run dovrebbe avere un publisher H2 e **nessun subscriber**.
-Il topic reale deve ancora avere **zero publisher H2**. Se i conteggi
-differiscono, identificare i processi prima di procedere.
-
-## 7. Solo dopo: inviare coppie al controller reale
-
-Fermare **solo H2 dry run** con `Ctrl+C` e verificare che sia terminato:
+Nella shell `nsenter` preparata alla sezione 5, con controller PC1, gripper e
+camera attivi, controllare che non esista già un altro processo H2 e che il
+topic reale delle coppie abbia un subscriber del controller:
 
 ```bash
 pgrep -af '[h]2_vmc_ros.py'
+ros2 topic info /robot1/torque_subscriber_controller/external_torques --verbose
 ```
 
-Non avviare contemporaneamente due H2. Sul PC1 o da una shell ROS che vede il
-controller, ricontrollare il **topic reale esatto** e il suo subscriber:
+`pgrep` non stampa nulla quando non c'è già un H2. `topic info` deve mostrare
+il tipo `std_msgs/msg/Float64MultiArray` e un subscriber del controller. Se
+non è così, controllare il nome del topic sul PC1 prima del launch. Il comando
+seguente usa **il controller reale** e i valori richiesti per la prova:
 
 ```bash
-ros2 control list_controllers
-ros2 topic list -t | grep -E 'torque|external'
-ros2 topic info NOME_TOPIC_REALE --verbose
-```
-
-Sostituire `NOME_TOPIC_REALE` con il nome trovato; non usare automaticamente
-il vecchio topic `julia_torque_controller`. Prima della prova reale concordare
-sul robot i guadagni, la posa marker, la calibrazione e l'area di movimento.
-I default del launch H2 (`stiffness=2000`, `damping=50`, `max_force=20`) non
-sono stati validati qui con il nuovo controller. `max_force` limita ogni
-componente di ogni molla virtuale: non limita la coppia totale ai giunti e
-non satura il contributo dei damper.
-
-Nella **stessa** shell `nsenter`, con modello, profilo DDS e viewer già
-preparati, impostare il topic verificato e avviare una sola istanza H2:
-
-```bash
-export REAL_TORQUE_TOPIC=/sostituire/con/il/topic/verificato
 ros2 launch /workspace/VMControl/FR3/h2_vmc.launch.py \
   start_h2:=true \
   python_executable:=/opt/venv/bin/python \
-  sub_topic:=/robot2/franka/joint_states \
+  sub_topic:=/robot1/franka/joint_states \
   camera_topic:=/vision/aruco_pose \
-  torque_pub_topic:="$REAL_TORQUE_TOPIC" \
-  stiffness:=VALORE_CONCORDATO \
-  damping:=VALORE_CONCORDATO \
-  max_force:=VALORE_CONCORDATO \
+  torque_pub_topic:=/robot1/torque_subscriber_controller/external_torques \
+  stiffness:=600 \
+  damping:=30 \
+  max_force:=10 \
+  headless:=false \
   duration:=0
 ```
 
-Questi comandi **pubblicano coppie verso il robot reale** quando
-`REAL_TORQUE_TOPIC` è quello del controller. H2 si avvia solo dopo la prima
-posa camera e il primo stato robot; il target non viene creato con coordinate
-provvisorie. Per comportamento inatteso usare la procedura di stop del
-laboratorio. Il timeout Python invia zero coppia VMC aggiuntiva se lo stato
-diventa vecchio, ma non sostituisce l'arresto del sistema robotico.
+`headless:=false` richiede il viewer X11; `duration:=0` mantiene H2 attivo
+finché non viene fermato. H2 attende una prima posa camera valida e un primo
+`JointState`, poi crea i tre collegamenti virtuali. A ogni aggiornamento usa
+lo stato reale misurato, calcola le coppie nel modello virtuale e le pubblica
+verso il controller. Non chiama `mj_step` per far evolvere un secondo robot
+dinamico.
+
+Questa configurazione può muovere il **robot reale** e può chiedere al nodo
+gripper una chiusura su `/hand/finger_distance`: la prova non è ancora stata
+validata come funzionante. `max_force=10` limita ogni componente delle forze
+elastiche virtuali, non la coppia totale ai giunti né il contributo dei
+damper. Il timeout Python invia zero coppia VMC aggiuntiva se lo stato diventa
+vecchio, ma non sostituisce l'arresto del sistema robotico.
+
+## 7. Verificare la comunicazione durante la prova
+
+Sul PC2, nella shell `nsenter`, gli stati del PC1 devono arrivare anche prima
+di lanciare H2. Per vedere la frequenza ricevuta:
+
+```bash
+ros2 topic hz /robot1/franka/joint_states
+```
+
+Interrompere con `Ctrl+C` dopo alcuni secondi. Sul PC1, nella shell ROS già
+configurata con dominio 42, mentre H2 è attivo:
+
+```bash
+ros2 topic info /robot1/torque_subscriber_controller/external_torques --verbose
+ros2 topic echo /robot1/torque_subscriber_controller/external_torques --once --qos-reliability best_effort
+ros2 topic hz /robot1/torque_subscriber_controller/external_torques
+```
+
+`topic info` mostra publisher H2 e subscriber del controller; `echo --once`
+conferma che almeno un messaggio arriva al PC1. `hz` misura la frequenza
+**ricevuta dal comando diagnostico**, che ad alta frequenza può essere
+inferiore a quella del publisher; interromperlo dopo pochi secondi. Queste
+verifiche non dimostrano da sole che il controller applichi correttamente le
+coppie. Se compare il problema X11 del log, H2 termina prima che il viewer si
+apra: correggere l'accesso al display e non considerare riuscita la prova.
 
 ## 8. Parametri del launch H2
 
 Il launch espone i parametri del parser di `h2_vmc_ros.py` usando
 `nome:=valore`. Il gripper usa **lo stesso file launch** ma un'altra
-invocazione con `start_h2:=false`; la camera usa il suo launch separato.
+invocazione con `start_h2:=false`; la camera usa il suo launch separato. La
+tabella riporta **i valori del comando reale della sezione 6**, non i default
+del file launch: usare il comando completo per riprodurre questa configurazione.
 
-| Launch | Default | Significato |
-|---|---:|---|
-| `start_h2` | `false` | `false`: solo gripper; `true`: solo H2 |
-| `python_executable` | `python3` | Passare l'interprete host o container esplicitamente |
-| `gripper_port` | `/dev/ttyUSB0` | Porta del gripper, usata solo con `start_h2:=false` |
-| `sub_topic` | `/robot2/franka/joint_states` | Stati reali letti da H2 |
-| `torque_pub_topic` | `/vmc/h2_dry_run_torques` | Coppie pubblicate da H2 |
+| Argomento | Valore nella sezione 6 | Significato |
+|---|---|---|
+| `start_h2` | `true` | Avvia H2 anziché il gripper |
+| `python_executable` | `/opt/venv/bin/python` | Python VMC nella shell `nsenter` |
+| `sub_topic` | `/robot1/franka/joint_states` | Stati reali letti da H2 |
+| `torque_pub_topic` | `/robot1/torque_subscriber_controller/external_torques` | Coppie inviate al controller reale |
 | `camera_topic` | `/vision/aruco_pose` | Posa target della Zivid |
-| `pub_rate` | `1000.0` Hz | Frequenza di pubblicazione ROS |
+| `pub_rate` | `1000.0` Hz | Frequenza ROS richiesta dal launch |
 | `link_length` | `0.4` m | Distanza TCP–site superiore |
-| `stiffness` | `2000.0` N/m | Rigidezza per collegamento |
-| `damping` | `50.0` Ns/m | Smorzamento per collegamento |
-| `max_force` | `20.0` N | Saturazione per componente di ciascuna molla |
+| `stiffness` | `600` N/m | Rigidezza per collegamento |
+| `damping` | `30` Ns/m | Smorzamento per collegamento |
+| `max_force` | `10` N | Saturazione per componente della molla |
 | `timestep` | `0.001` s | Intervallo di pacing del loop Python |
 | `state_timeout` | `0.2` s | Soglia di stato robot scaduto |
-| `duration` | `0` | Continuo fino a stop; valore positivo in secondi |
-| `headless` | `false` | `true` non apre il viewer |
+| `duration` | `0` | Continuo fino a stop |
+| `headless` | `false` | Apre il viewer |
 
-Esempio di cambio di guadagni per **dry run**:
-`stiffness:=1500 damping:=20 max_force:=15`. Il parser legge i valori
-all'avvio: dopo una modifica occorre fermare e rilanciare H2.
+Il parser legge i valori all'avvio: dopo una modifica occorre fermare e
+rilanciare H2.
 
 ## 9. Arresto e note pratiche
 
@@ -436,3 +413,139 @@ modello da circa 34 MB. È dentro il repository Git ma non deve essere caricata
 per errore con `git add .`. Se deve restare solo sul PC2, aggiungere
 `/fr3_robotiq_2f_140/` a `~/VMControl/.git/info/exclude` (esclusione solo
 locale, non sincronizzata su GitHub).
+
+## 10. Simulazione H2 sul Mac con ROS e viewer
+
+Questa sezione riguarda `h2_simulations.py` sul Mac. Il robot e il gripper
+sono simulati: i topic `/mujoco/h2/joint_states` e `/mujoco/h2/torques`
+servono alla diagnostica e non sono i topic del controller reale. Il marker
+giallo sostituisce la camera e si può trascinare nel viewer. ROS, MuJoCo e il
+viewer girano nello **stesso container**. Lo schermo virtuale viene mostrato
+dal Mac tramite Condivisione schermo; XQuartz non è necessario.
+
+Preparare una volta l'immagine grafica dal terminale del Mac:
+
+```bash
+cd "/Users/lorenzotucci/Desktop/Progetto Tesi/MuJoCo Projects/ROS2"
+docker build --target gui -t vmc-ros-gui:humble .
+```
+
+Avviare la simulazione dal terminale del Mac:
+
+```bash
+docker run --rm -d --name h2-vmc-gui \
+  -p 127.0.0.1:5901:5900 \
+  -v "/Users/lorenzotucci/Desktop/Progetto Tesi:/workspace" \
+  -w "/workspace/MuJoCo Projects/FR3" \
+  -e PYTHONPATH=/workspace/mujoco-vmc-main \
+  -e ROS_DOMAIN_ID=42 \
+  -e ROS_LOCALHOST_ONLY=1 \
+  -e LIBGL_ALWAYS_SOFTWARE=1 \
+  vmc-ros-gui:humble bash -lc '
+set -e
+Xvfb :99 -screen 0 1280x800x24 +extension GLX -nolisten tcp -noreset >/tmp/h2-xvfb.log 2>&1 &
+for i in $(seq 1 50); do test -S /tmp/.X11-unix/X99 && break; sleep 0.1; done
+test -S /tmp/.X11-unix/X99
+export DISPLAY=:99
+fluxbox >/tmp/h2-fluxbox.log 2>&1 &
+viewer_password=$(python3 -c "import secrets; print(secrets.token_hex(4))")
+x11vnc -storepasswd "$viewer_password" /tmp/h2-vnc.pass >/dev/null 2>&1
+printf "VNC password: %s\n" "$viewer_password"
+x11vnc -display :99 -forever -shared -rfbauth /tmp/h2-vnc.pass -rfbport 5900 -listen 0.0.0.0 -noxdamage >/tmp/h2-vnc.log 2>&1 &
+source /opt/ros/humble/setup.bash
+exec python3 -u h2_simulations.py --duration 0
+'
+```
+
+La porta VNC è pubblicata soltanto su `127.0.0.1` del Mac. Per leggere la
+password temporanea e verificare l'avvio:
+
+```bash
+docker logs h2-vmc-gui
+```
+
+Aprire l'app **Condivisione schermo** del Mac, scegliere **Nuova connessione**,
+inserire `vnc://127.0.0.1:5901` e usare la password stampata nel log. La
+finestra MuJoCo appare dentro la sessione VNC. Se la porta 5901 è occupata,
+scegliere un'altra porta locale cambiando soltanto il primo `5901` in `-p` e
+nell'indirizzo VNC.
+
+Per leggere una coppia pubblicata, da un altro terminale del Mac:
+
+```bash
+docker exec -it h2-vmc-gui bash -lc \
+  'source /opt/ros/humble/setup.bash && ros2 topic echo /mujoco/h2/torques --once --qos-reliability best_effort'
+```
+
+Terminare la prova con `docker stop h2-vmc-gui`; `--rm` rimuove il container
+fermo. L'immagine `vmc-ros-gui:humble` rimane disponibile per le prove future.
+
+## 11. PC2 — camera reale e pick simulato in MuJoCo
+
+`h2_camera_simulation.py` riceve `/vision/aruco_pose` dalla Zivid e controlla
+un FR3 con Robotiq interamente simulato. Le coppie vengono assegnate a
+`qfrc_applied` e applicate con `mj_step`; la chiusura modifica solo il gripper
+MuJoCo. Lo script non pubblica comandi di coppia o di chiusura e non legge gli
+stati del robot reale. Per questa prova non servono il controller sul PC1 o
+il nodo del gripper fisico.
+
+Portare sul PC2 **entrambi** i file `h2_camera_simulation.py` e
+`h2_simulations.py`: il primo importa dal secondo le funzioni geometriche,
+senza eseguirne il `main`. Servono anche il modello FR3/Robotiq con le mesh e
+la libreria `mujoco_vmc` gia usati sul PC2.
+
+Avviare la camera dall'host PC2 come nella sezione 4; se e gia in esecuzione,
+usare quella istanza. La posa deve essere in metri con `frame_id="base"`.
+Poi aprire la shell VMC del PC2 seguendo la sezione 5, incluso il profilo UDP,
+con dominio 42 e `ROS_LOCALHOST_ONLY=0`. Verificare da quella shell:
+
+```bash
+ros2 topic echo /vision/aruco_pose --once
+```
+
+Per aprire la simulazione, nella stessa shell VMC:
+
+```bash
+cd /workspace/VMControl/FR3
+/opt/venv/bin/python h2_camera_simulation.py \
+  --scene /workspace/VMControl/fr3_robotiq_2f_140/fr3_robotiq_2f_140/scene_fr3_robotiq.xml \
+  --camera-topic /vision/aruco_pose \
+  --stiffness 600 \
+  --damping 30 \
+  --max-force 10 \
+  --duration 0
+```
+
+Il viewer e attivo per default. Usa il display Linux del PC2; se ricompare
+l'errore GLFW/X11, seguire il paragrafo "Viewer X11" della sezione 5. Per una
+prima verifica del topic senza grafica si puo aggiungere
+`--headless --duration 10` allo stesso comando (sostituendo `--duration 0`).
+
+Il robot simulato parte dal keyframe `home` e resta fermo finche arriva la
+prima posa valida. Dopo, la sequenza e:
+
+1. Aggiornare i tre target dalla camera, con la stessa geometria di H2.
+2. Copiare q e dq del robot simulato nella copia virtuale ed eseguire `mj_forward`.
+3. Calcolare le coppie VMC, aggiungere il bias del modello dinamico e limitare
+   le coppie ai limiti dei giunti.
+4. Eseguire `mj_step` sul robot simulato.
+5. Richiedere la chiusura simulata quando TCP e tre collegamenti restano entro
+   1 cm per 0,5 s con una posa camera recente.
+
+Per riprodurre il comportamento attuale di `h2_vmc_ros.py`, oltre 0,8 s senza
+una posa valida si impedisce una nuova chiusura ma resta attivo l'ultimo
+target VMC. Durante `CLOSING` le nuove pose continuano ad aggiornare i target
+e non annullano la chiusura. Questi eventi sono stampati insieme a un
+riepilogo degli errori una volta al secondo.
+
+`CLOSED` conferma soltanto che le dita simulate hanno raggiunto l'angolo di
+chiusura. La camera non ricostruisce automaticamente un oggetto fisico in
+MuJoCo: questa versione verifica avvicinamento e chiusura, non il contatto o
+la qualita della presa. Inoltre la configurazione iniziale e la dinamica
+MuJoCo possono differire dal FR3 reale.
+
+Verifica locale: dinamica senza ROS e senza viewer, arrivo e chiusura con
+errore TCP finale di circa 2,4 mm per un target sintetico raggiungibile;
+verificati anche la conservazione dell'ultimo target dopo timeout e
+l'aggiornamento del target durante la chiusura. La ricezione ROS dalla Zivid
+e il viewer sul PC2 restano da verificare sul computer del laboratorio.

@@ -144,8 +144,10 @@ def main():
     parser.add_argument("--pub-rate", type=float, default=1000.0, help="Publish rate in Hz for outgoing ROS topics (default: 1000.0)")
     parser.add_argument("--link-length", type=float, default=0.4, help="Distance from TCP to the upper virtual spring site in meters (default: 0.4)")
     parser.add_argument("--stiffness", type=float, default=2000.0, help="VMC spring stiffness for each endpoint (N/m)")
+    parser.add_argument("--stiffness2", type=float, default=2000.0, help="VMC spring stiffness2 for each endpoint (N/m)")
     parser.add_argument("--damping", type=float, default=50.0, help="VMC damper coefficient for each endpoint (Ns/m)")
     parser.add_argument("--max-force", type=float, default=20.0, help="Maximum saturating VMC force per spring (N)")
+    parser.add_argument("--max-force2", type=float, default=20.0, help="Maximum saturating VMC force per spring2 (N)")
     parser.add_argument("--timestep", type=float, default=0.001, help="Controller loop pacing interval in seconds (default: 0.001); no mj_step is called")
     parser.add_argument("--state-timeout", type=float, default=0.2, help="Publish zero VMC torque if no new robot state arrives for this many seconds")
     parser.add_argument("--headless", action="store_true", help="Run in headless mode without passive viewer")
@@ -162,6 +164,8 @@ def main():
     # satisfied before entering CLOSING: TCP-to-target distance and the worst
     # of the three individual connection distances.
     phase = "APPROACH"
+    print("[INFO] APPROACH phase started")
+
     position_tolerance = 0.01 # 1 cm TCP position error.
     connection_tolerance = 0.01 # 1 cm maximum connection error.
 
@@ -349,7 +353,35 @@ def main():
         ],
         name="link_right_spring",
     )
+    conn_att_2 = VirtualConnection(
+        source=r_top_site,
+        target=target_top_spring,
+        components=[
+            TanhSpring(args.stiffness, max_force=args.max_force),
+            0,
+        ],
+        name="link_att_spring",
+    )
+    conn_left_2 = VirtualConnection(
+        source=r_left_site,
+        target=target_left,
+        components=[
+            TanhSpring(args.stiffness, max_force=args.max_force),
+            0,
+        ],
+        name="link_left_spring",
+    )
+    conn_right_2 = VirtualConnection(
+        source=r_right_site,
+        target=target_right,
+        components=[
+            TanhSpring(args.stiffness, max_force=args.max_force),
+            0,
+        ],
+        name="link_right_spring",
+    )
     mechanism = VirtualMechanism([conn_att,conn_left, conn_right])
+    mechanism_2 = VirtualMechanism([conn_att_2,conn_left_2, conn_right_2])
 
     # Refresh site poses/Jacobians from the initial robot state. perf_counter()
     # is monotonic and is used for age/timeout checks; time.time() only paces
@@ -465,16 +497,26 @@ def main():
             # Start a dwell timer on first arrival. Reset it whenever either
             # error or input freshness leaves the allowed region.
             if within_tolerance and robot_state_recent and camera_data_recent:
+                print("[INFO] Tolerance satisfied. Data are recent")
                 if t_arrival is None:
                     t_arrival = t_actual
+                    print("[INFO] T_arrival set")
 
                 elif t_actual - t_arrival >= 0.5:
                     # The phase change prevents a second close request on
                     # following iterations. The outer loop sends the command.
                     phase = "CLOSING"
+                    print("[INFO] CLOSING phase started")
                     close_requested = True
                     t_arrival = None
             else:
+                if t_arrival is not None:
+                    print(
+                        f"[ARRIVAL] Timer cancelled: "
+                        f"within_tolerance={within_tolerance}, "
+                        f"robot_recent={robot_state_recent}, "
+                        f"camera_recent={camera_data_recent}"
+                    )            
                 t_arrival = None
         
         # Read both gripper feedback buffers atomically with respect to their
@@ -497,6 +539,7 @@ def main():
             # A closing attempt that never reports a valid grasp expires.
             if phase == "CLOSING" and t_actual - t_close_request >= closing_timeout:
                 phase = "FAILED"
+                print("[INFO] CLOSING phase failed")
 
 
         # --- Compute and publish the virtual mechanism torque ---
@@ -512,7 +555,7 @@ def main():
         else:
             vmc_torques = np.zeros(sync.num_joints)
             if not state_timeout_logged:
-                print("[ROS2] Joint state timed out; publishing zero VMC torque")
+                
                 state_timeout_logged = True
         # Extract the seven robot DOFs in name order. No qfrc_bias or gravity
         # term is added here; the real controller must define that convention.
@@ -545,6 +588,7 @@ def main():
                 close_request = step_iteration()
                 if close_request:
                     gripper_pub.publish(close_msg)
+                    print("[GRIPPER] Close request published: target_width=0.001 m")
                     t_close_request = time.perf_counter()
                 # Sleep only for the remaining fraction of this tick. If the
                 # calculation ran late, restart pacing from the current time
@@ -565,6 +609,7 @@ def main():
                     close_request = step_iteration()
                     if close_request:
                         gripper_pub.publish(close_msg)
+                        print("[GRIPPER] Close request published: target_width=0.001 m")
                         t_close_request = time.perf_counter()
 
                     now = time.perf_counter()
