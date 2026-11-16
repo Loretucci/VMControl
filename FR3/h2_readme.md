@@ -526,9 +526,20 @@ cd /workspace/VMControl/FR3
 `--stiffness2` e `--max-force2` controllano solo le molle della seconda serie;
 i default sono rispettivamente 2000 N/m e 20 N per componente. Per escludere
 il loro contributo durante un confronto si puo usare `--stiffness2 0`.
-Nel file reale attualmente la seconda serie e definita ma non applicata:
-questa simulazione la rende attiva, quindi non equivale al controllo reale
-finche quest'ultimo non applica entrambe le serie con gli stessi parametri.
+Per confrontare simulazione e controllo reale, impostare esplicitamente
+gli stessi guadagni di entrambe le serie: i default dei due parser possono
+essere diversi.
+
+Correzione geometrica verificata con la posa camera del 16 novembre: il
+marker ha asse +z quasi parallelo a -z della base. Il punto superiore del
+gripper si trova lungo -z del TCP, quindi il suo target viene costruito con
+`p_top = p_target - L * z_aruco`, per avere TCP +z allineato a marker +z.
+Con quella posa, il precedente segno `+` metteva il target superiore a
+z=-0,331 m e richiedeva un assetto con il corpo del gripper sotto il piano;
+la simulazione restava in contatto con il pavimento. Il segno `-` mette il
+target superiore a z=0,469 m. Questa correzione e nel file di simulazione;
+la formula nel file reale va controllata e allineata prima di trasferire
+il risultato al robot fisico.
 
 Il viewer e attivo per default. Usa il display Linux del PC2; se ricompare
 l'errore GLFW/X11, seguire il paragrafo "Viewer X11" della sezione 5. Per una
@@ -540,7 +551,8 @@ attende la prima posa camera valida prima di creare i tre collegamenti e
 aprire il viewer. Finche compare `[WAIT]`, non si e ancora entrati nel loop
 di controllo. Dopo, la sequenza e:
 
-1. Aggiornare i tre target dalla camera, con la stessa geometria di H2.
+1. Aggiornare i tre target dalla camera, usando il segno corretto per il
+   punto superiore descritto sopra.
 2. Copiare q e dq del robot simulato nella copia virtuale ed eseguire `mj_forward`.
 3. Sommare le coppie VMC dei due meccanismi, aggiungere il bias del modello
    dinamico e limitare le coppie ai limiti dei giunti.
@@ -560,11 +572,14 @@ MuJoCo: questa versione verifica avvicinamento e chiusura, non il contatto o
 la qualita della presa. Inoltre la configurazione iniziale e la dinamica
 MuJoCo possono differire dal FR3 reale.
 
-Verifica locale: dinamica senza ROS e senza viewer, arrivo e chiusura per un
-target sintetico raggiungibile. Con la doppia serie attiva l'errore TCP finale
-era circa 0,72 mm; con `--stiffness2 0` circa 2,4 mm. Verificata la somma dei
-contributi dei due meccanismi senza azzeramento intermedio delle coppie.
-Nelle verifiche precedenti erano stati controllati anche la conservazione
-dell'ultimo target dopo timeout e l'aggiornamento del target durante la
-chiusura. La ricezione ROS dalla Zivid e il viewer sul PC2 restano da
-verificare sul computer del laboratorio.
+Verifica geometrica e dinamica del 16 novembre, senza ROS o viewer: usando
+la posa ArUco comunicata da Lorenzo e i guadagni 20/1500 N/m, damping 20 Ns/m,
+limiti elastici 10/2 N, il vecchio segno ha riprodotto l'errore TCP di
+57,5 mm, il collegamento superiore lungo 742,5 mm e i contatti col pavimento.
+Con il segno corretto, lo script e arrivato a `CLOSED`, con errore TCP di
+circa 0,16 mm e massimo errore dei collegamenti di circa 6,7 mm, senza
+contatti col pavimento alla fine della prova. In questa verifica l'ingresso
+ROS e il clock sono stati sostituiti localmente con la posa ricevuta e un
+clock di test. Le verifiche precedenti su target sintetici hanno controllato
+la somma delle coppie, il timeout camera e l'aggiornamento durante la
+chiusura. Il nuovo comportamento va riprovato con camera e viewer sul PC2.

@@ -5,6 +5,9 @@ first camera pose, creates two sets of three connections, and runs step_iteratio
 Measured q,dq come from data_sim instead of PC1; torques are applied with
 mj_step instead of being published. The gripper closes only inside MuJoCo.
 There are no robot torque publishers or physical gripper command publishers.
+
+The lab marker pose has +z pointing down toward the object. TCP +z follows
+that direction, so the upper force target lies along marker -z.
 """
 
 import argparse
@@ -114,13 +117,14 @@ def build_positions(camera_pose, link_length):
     x_aruco_in_base = R_base_aruco[:, 0]
     z_aruco = R_base_aruco[:, 2]
     # With h=0, the desired TCP coincides with the marker origin. The side
-    # targets lie along marker x and the top target along marker z.
+    # targets lie along marker x. The upper robot site is at -L along TCP z,
+    # so matching TCP +z to marker +z puts its target along marker -z.
     h = 0.0
     p_target = p_marker - h * z_aruco
     p_left = p_target + 0.30 * x_aruco_in_base
     p_right = p_target - 0.30 * x_aruco_in_base
-    # This is the position the upper gripper site is pulled toward.
-    p_top = p_target + L * z_aruco
+    # For the measured lab marker (+z downward), this point is above the marker.
+    p_top = p_target - L * z_aruco
 
     return p_top,p_left,p_right, R_base_aruco
 
