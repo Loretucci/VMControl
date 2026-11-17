@@ -78,7 +78,7 @@ def build_ee_link_model(
     ee_spec.add_site(name="gripper_left_finger", pos=[tcp_pos[0], tcp_pos[1] - 0.3, tcp_pos[2]], size=[0.012, 0.0, 0.0], rgba=[1.0, 0.0, 0.0, 0.8], group=0)
     ee_spec.add_site(name="gripper_right_finger", pos=[tcp_pos[0], tcp_pos[1] + 0.3, tcp_pos[2]], size=[0.012, 0.0, 0.0], rgba=[1.0, 0.0, 0.0, 0.8], group=0)
 
-def build_positions(camera_pose, link_length, height_offset=0.015):
+def build_positions(camera_pose, link_length, height_offset=0.015, yaw_sign=1):
     """Build the three target points from one measured base-frame marker pose.
 
     camera_pose contains (position, quaternion, receive_time). The position is
@@ -87,6 +87,7 @@ def build_positions(camera_pose, link_length, height_offset=0.015):
     compared directly with MuJoCo's site_xpos values.
     height_offset raises the TCP and all three anchors along base +z. The
     default is 1.5 cm for picking; H3 passes zero for its separate place offset.
+    yaw_sign=-1 selects the equivalent 180-degree grasp about marker z.
     """
     L = float(link_length)
     p_marker, q_marker, received_at = camera_pose
@@ -96,6 +97,8 @@ def build_positions(camera_pose, link_length, height_offset=0.015):
     rotation_flat = np.empty(9)
     mujoco.mju_quat2Mat(rotation_flat, q_marker)  # MuJoCo quaternion order: w, x, y, z.
     R_base_aruco = rotation_flat.reshape(3, 3)
+    # Flip both in-plane axes together to preserve a right-handed frame.
+    R_base_aruco[:, :2] *= yaw_sign
 
     x_aruco_in_base = R_base_aruco[:, 0]
     z_aruco = R_base_aruco[:, 2]
@@ -154,6 +157,20 @@ def orientation_from_points(attachment, left, right):
     z_axis /= np.linalg.norm(z_axis)
     y_axis = np.cross(z_axis, x_axis)
     return np.column_stack((x_axis, y_axis, z_axis))
+
+
+def select_yaw_sign(camera_pose, link_length, current_top, current_left, current_right):
+    """Choose the nearer equivalent yaw once at the start of a motion.
+
+    The candidates share z and differ by 180 degrees about it. Maximizing
+    the rotation trace selects the smaller angle from the measured gripper.
+    The caller keeps this sign fixed while subsequent camera poses arrive.
+    """
+    target_top, target_left, target_right, _ = build_positions(camera_pose, link_length)
+    target_rotation = orientation_from_points(target_top, target_left, target_right)
+    current_rotation = orientation_from_points(current_top, current_left, current_right)
+    alignment = np.sum(target_rotation[:, :2] * current_rotation[:, :2])
+    return 1 if alignment >= 0.0 else -1
 
 
 def configure_gripper_force(node, force, timeout=5.0):
@@ -403,17 +420,24 @@ def main():
     # after this assignment; later messages go through apply_incoming_state().
     sync.set_state(data, initial_qpos, initial_qvel, forward=True)
 
-    # Only now can the camera pose be converted into initial virtual targets.
-    # The three target objects are held in Python, not inserted into the XML.
-    target_top_position, target_left_position, target_right_position, R_base_aruco  = build_positions(first_camera_pose, args.link_length)
-    target_top_spring, target_left, target_right = build_ref_objects(target_top_position, target_left_position, target_right_position, R_base_aruco)
-
     # Resolve compiled site IDs once. The TCP is the contact/error point; the
     # other three sites are where the virtual spring/damper forces act.
     tcp_id = model.site("tcp").id
     top_spring_id = model.site("ee_top_spring").id
     left_grip_id = model.site("gripper_left_finger").id
     right_grip_id = model.site("gripper_right_finger").id
+
+    # Choose the nearer symmetric grasp once; camera updates retain this branch.
+    pick_yaw_sign = select_yaw_sign(
+        first_camera_pose, args.link_length, data.site_xpos[top_spring_id],
+        data.site_xpos[left_grip_id], data.site_xpos[right_grip_id],
+    )
+    print(f"[TARGET] Pick yaw branch: {0 if pick_yaw_sign == 1 else 180} deg; fixed for this approach")
+    target_top_position, target_left_position, target_right_position, R_base_aruco = build_positions(
+        first_camera_pose, args.link_length, yaw_sign=pick_yaw_sign
+    )
+    target_top_spring, target_left, target_right = build_ref_objects(target_top_position, target_left_position, target_right_position, R_base_aruco)
+
     # MuJoCoSite wraps each compiled site so the VMC library can obtain its
     # world position/velocity and map a Cartesian force to generalized joint
     # force through the site's Jacobian transpose.
@@ -550,7 +574,9 @@ def main():
         elif camera_pose is not None:
             # Resume tracking with the new observation. CLOSING and later
             # phases keep their existing camera-update behavior.
-            new_p_top, new_p_left, new_p_right, new_rotation = build_positions(camera_pose, args.link_length)
+            new_p_top, new_p_left, new_p_right, new_rotation = build_positions(
+                camera_pose, args.link_length, yaw_sign=pick_yaw_sign
+            )
             update_positions(new_p_top, new_p_left, new_p_right, new_rotation,
                              target_top_spring, target_left, target_right)
             if camera_hold_active:

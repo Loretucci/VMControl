@@ -93,12 +93,14 @@ def add_camera_marker(spec: mujoco.MjSpec) -> None:
         )
 
 
-def build_positions(camera_pose, link_length: float, height_offset: float = 0.015):
-    """Convert the sampled marker pose to H2's three world-frame targets."""
+def build_positions(camera_pose, link_length: float, height_offset: float = 0.015, yaw_sign: int = 1):
+    """Build H2 targets; yaw_sign=-1 selects the equivalent 180-degree grasp."""
     p_marker, q_marker = camera_pose  # Quaternion order: w, x, y, z.
     rotation_flat = np.empty(9)
     mujoco.mju_quat2Mat(rotation_flat, q_marker)
     R_base_marker = rotation_flat.reshape(3, 3)
+    # Flip both in-plane axes together to preserve a right-handed frame.
+    R_base_marker[:, :2] *= yaw_sign
     x_marker = R_base_marker[:, 0]
     z_marker = R_base_marker[:, 2]
 
@@ -157,6 +159,20 @@ def orientation_from_points(top, left, right) -> np.ndarray:
     z_axis /= np.linalg.norm(z_axis)
     y_axis = np.cross(z_axis, x_axis)
     return np.column_stack((x_axis, y_axis, z_axis))
+
+
+def select_yaw_sign(camera_pose, link_length, current_top, current_left, current_right):
+    """Choose the nearer equivalent yaw once at the start of a motion.
+
+    The candidates share z and differ by 180 degrees about it. Maximizing
+    the rotation trace selects the smaller angle from the measured gripper.
+    The caller keeps this sign fixed while subsequent camera poses arrive.
+    """
+    target_top, target_left, target_right, _ = build_positions(camera_pose, link_length)
+    target_rotation = orientation_from_points(target_top, target_left, target_right)
+    current_rotation = orientation_from_points(current_top, current_left, current_right)
+    alignment = np.sum(target_rotation[:, :2] * current_rotation[:, :2])
+    return 1 if alignment >= 0.0 else -1
 
 
 def main() -> None:
@@ -252,7 +268,14 @@ def main() -> None:
     real.mocap_quat[marker_id] = marker_quaternion_from_sites(real, tcp_id, top_id, left_id, right_id)
     mujoco.mj_forward(model, real)
     initial_camera_pose = (real.mocap_pos[marker_id].copy(), real.mocap_quat[marker_id].copy())
-    p_top, p_left, p_right, rotation = build_positions(initial_camera_pose, args.link_length)
+    pick_yaw_sign = select_yaw_sign(
+        initial_camera_pose, args.link_length, real.site_xpos[top_id],
+        real.site_xpos[left_id], real.site_xpos[right_id],
+    )
+    print(f"[TARGET] Pick yaw branch: {0 if pick_yaw_sign == 1 else 180} deg; fixed for this approach")
+    p_top, p_left, p_right, rotation = build_positions(
+        initial_camera_pose, args.link_length, yaw_sign=pick_yaw_sign
+    )
     target_top = new_target("target_attachment_site", p_top, rotation)
     target_left = new_target("target_left_finger", p_left, rotation)
     target_right = new_target("target_right_finger", p_right, rotation)
@@ -310,7 +333,7 @@ def main() -> None:
             q_norm = np.linalg.norm(q_marker)
             if np.all(np.isfinite(p_marker)) and np.all(np.isfinite(q_marker)) and q_norm > 1e-6:
                 p_top, p_left, p_right, rotation = build_positions(
-                    (p_marker, q_marker / q_norm), args.link_length
+                    (p_marker, q_marker / q_norm), args.link_length, yaw_sign=pick_yaw_sign
                 )
                 for target, position in ((target_top, p_top), (target_left, p_left), (target_right, p_right)):
                     target.set_state(ObjectState(position=position, rotation=rotation, linear_velocity=np.zeros(3)))

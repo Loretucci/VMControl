@@ -361,6 +361,21 @@ modello virtuale e le pubblica
 verso il controller. Non chiama `mj_step` per far evolvere un secondo robot
 dinamico.
 
+Prima di costruire i collegamenti, H2 confronta la posa misurata della pinza
+con due riferimenti equivalenti per la presa: quello del marker e quello
+ruotato di 180 gradi attorno al suo asse z. Sceglie quello che richiede la
+rotazione minore. Nel secondo caso inverte insieme gli assi x e y del
+riferimento: i due target laterali si scambiano, mentre TCP, quota di pick e
+target superiore restano identici. La scelta vale per le forze VMC e per gli
+errori usati dal controllo di arrivo; le tolleranze restano 1 cm per 0,5 s.
+
+Il messaggio `[TARGET] Pick yaw branch: 0 deg` oppure `180 deg` indica la
+rotazione scelta rispetto al marker, non l'angolo assoluto nella base. La
+scelta resta fissa durante gli aggiornamenti camera e dopo un timeout con
+successiva ripresa del tracking. La stessa logica e applicata in
+`h2_camera_simulation.py` e `h2_simulations.py`. La posa pubblicata dalla
+camera resta la posa effettivamente rilevata del marker.
+
 Per ciascuno dei tre punti, la prima serie usa `stiffness`, `max_force` e
 `damping`; la seconda aggiunge una molla con `stiffness2` e `max_force2`,
 senza un secondo damper. Il launch trasmette entrambi i gruppi al parser:

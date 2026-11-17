@@ -413,6 +413,21 @@ Il ciclo è:
 
 `APPROACH → CLOSING → GRASPED → TRANSFER → OPENING → WAIT_FOR_MOVE → APPROACH`
 
+All'inizio di ogni pick, H3 sceglie fra il riferimento del marker e il suo
+equivalente ruotato di 180 gradi attorno all'asse z, usando la rotazione piu
+vicina alla pinza misurata. L'inversione riguarda insieme x e y: scambia i
+target laterali senza cambiare TCP, quota di pick o target superiore. La
+scelta resta fissa durante `APPROACH`, i timeout camera e `CLOSING`; viene
+ricalcolata dalla posa corrente quando parte un nuovo ciclo.
+
+Quando viene fissata la destinazione sul tavolo, H3 esegue una scelta
+indipendente fra le due orientazioni equivalenti del marker tavolo, poi
+mantiene fissi tutti e tre i target durante il trasferimento. I messaggi
+`[TARGET] Pick yaw branch` e `[TARGET] Place yaw branch` riportano 0 o 180
+gradi rispetto al rispettivo marker. Questa selezione modifica i target
+delle molle e il riferimento diagnostico, senza allargare le tolleranze di
+arrivo. La stessa logica e presente in `h3_simulations.py`.
+
 - **APPROACH:** segue il cubo con il TCP desiderato 1,5 cm sopra il marker.
   TCP e tre collegamenti devono restare
   entro 1 cm per 0,5 s, con dati recenti, prima della richiesta di chiusura.
