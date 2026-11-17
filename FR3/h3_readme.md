@@ -367,9 +367,8 @@ ros2 topic info /robot1/torque_subscriber_controller/external_torques --verbose
 
 ### 5.4 Avvio del controllo reale
 
-Il comando seguente esplicita i **default attuali del parser reale**.
-È una configurazione del codice da validare nella prova fisica, distinta
-dai guadagni della simulazione della sezione 4.
+Il comando seguente riporta i **parametri tarati da Lorenzo per H3 sul robot
+reale**.
 
 Esegui nella shell VMC, dopo aver confermato i prerequisiti sopra:
 
@@ -385,9 +384,9 @@ export MUJOCO_MENAGERIE_PATH=/workspace/VMControl/fr3_robotiq_2f_140
   --gripper-force 30 \
   --link-length 0.8 \
   --stiffness 2000 \
-  --stiffness2 20 \
-  --damping 50 \
-  --max-force 2 \
+  --stiffness2 50 \
+  --damping 20 \
+  --max-force 4 \
   --max-force2 8 \
   --state-timeout 0.2 \
   --pub-rate 1000 \
