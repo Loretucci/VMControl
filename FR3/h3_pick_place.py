@@ -1,10 +1,14 @@
-"""Drive the real FR3 with virtual connections anchored to an ArUco pose.
+"""Repeat camera-guided pick-and-place cycles on the real FR3.
 
 The camera supplies a target pose in the robot base frame. ROS supplies the
 measured joint positions and velocities. MuJoCo computes kinematics and maps
 the virtual spring/damper forces to joint torques. The robot trajectory comes
 from ROS; this file does not advance the robot with ``mj_step``. The optional
 passive viewer displays the measured configuration.
+
+The cube marker supplies the pick pose. The table marker supplies one fixed
+place target, raised by 0.035 m along base z. After opening is confirmed,
+wait for fresh observations of a displaced cube before starting a new cycle.
 
 During APPROACH, a camera timeout retargets both mechanisms once to the
 current measured site positions. Springs and dampers then hold that pose
@@ -222,11 +226,11 @@ def main():
     # Configuration is kept on the command line so the ROS topic names and
     # mechanism gains can be changed without editing the model file. Topic
     # names must match the physical controller and camera publishers.
-    parser = argparse.ArgumentParser(description="FR3 virtual-mechanism torque controller")
+    parser = argparse.ArgumentParser(description="FR3 ArUco-guided repeated pick-and-place controller")
     parser.add_argument("--sub-topic", "--topic", dest="topic", type=str, default="/robot/joint_states", help="Topic to receive real robot states (default: /robot/joint_states)")
     parser.add_argument("--torque-pub-topic", type=str, default="/mujoco/robot/torques", help="Topic to publish computed joint torques (default: /mujoco/robot/torques)")
     parser.add_argument("--pub-rate", type=float, default=1000.0, help="Publish rate in Hz for outgoing ROS topics (default: 1000.0)")
-    parser.add_argument("--link-length", type=float, default=0.8, help="Distance from TCP to the upper virtual spring site in meters (default: 0.4)")
+    parser.add_argument("--link-length", type=float, default=0.8, help="Distance from TCP to the upper virtual spring site in meters (default: 0.8)")
     parser.add_argument("--target-radius", type=float, default=0.015, help="Radius of viewer-only target spheres in meters (default: 0.015)")
     parser.add_argument("--stiffness", type=float, default=2000.0, help="VMC spring stiffness for each endpoint (N/m)")
     parser.add_argument("--stiffness2", type=float, default=20.0, help="VMC spring stiffness2 for each endpoint (N/m)")
@@ -236,8 +240,11 @@ def main():
     parser.add_argument("--timestep", type=float, default=0.001, help="Controller loop pacing interval in seconds (default: 0.001); no mj_step is called")
     parser.add_argument("--state-timeout", type=float, default=0.2, help="Publish zero VMC torque if no new robot state arrives for this many seconds")
     parser.add_argument("--headless", action="store_true", help="Run in headless mode without passive viewer")
-    parser.add_argument("--duration", type=float, default=60.0, help="Run duration in seconds if headless (<= 0 runs indefinitely)")
+    parser.add_argument("--duration", type=float, default=0.0, help="Run duration in seconds in either mode (default: 0; <= 0 runs until stopped)")
     parser.add_argument("--camera-topic", type = str, default = "/vision/aruco_pose", help="Topic on which receiving ArUco pose")
+    parser.add_argument("--camera-table-topic", type=str, default="/vision/aruco_table_pose", help="Topic providing the table marker pose in the base frame",)
+    parser.add_argument("--restart-distance", type=float, default=0.05, help="Cube marker displacement from the last place target required for a new cycle (m; default: 0.05)")
+    parser.add_argument("--restart-dwell", type=float, default=0.5, help="Duration of fresh displaced-cube observations before restarting (s; default: 0.5)")
     parser.add_argument("--gripper-force", type=int, default=30, help="Robotiq force setting rFR, integer 1-255 (not Newtons); default: 30")
     #parser.add_argument("--scene", type = str, default = "mujoco/")
     args = parser.parse_args()
@@ -249,6 +256,10 @@ def main():
         parser.error("target-radius must be finite and positive")
     if not 1 <= args.gripper_force <= 255:
         parser.error("gripper-force must be between 1 and 255 (rFR, not Newtons)")
+    if not np.isfinite(args.restart_distance) or args.restart_distance <= 0:
+        parser.error("restart-distance must be finite and positive")
+    if not np.isfinite(args.restart_dwell) or args.restart_dwell <= 0:
+        parser.error("restart-dwell must be finite and positive")
 
     # Only APPROACH can issue a close request. The two thresholds must both be
     # satisfied before entering CLOSING: TCP-to-target distance and the worst
@@ -300,16 +311,18 @@ def main():
     # in the main thread outside the locks.
     camera_lock = Lock()
     latest_camera_pose = None
+    latest_camera_table_pose = None
     last_gripper_detection = None
     gripper_lock = Lock()
     last_gripper_status = None
+    last_gripper_distance = None
 
     # --- ROS callback functions ---
     def camera_callback(msg):
         """Store the newest finite marker pose received in the robot base frame."""
         nonlocal latest_camera_pose
 
-        # Camera coordinates are usable here only after zivid_camera_h2.py has
+        # Camera coordinates are usable here only after zivid_camera_h3.py has
         # transformed them into the same base frame used by the MuJoCo model.
         if msg.header.frame_id != "base":
             return
@@ -340,6 +353,41 @@ def main():
             # freshness; it is separate from the ROS header timestamp.
             latest_camera_pose = (p, q / norm, time.perf_counter())
 
+    def camera_table_callback(msg):
+        """Store the newest finite marker pose received in the robot base frame."""
+        nonlocal latest_camera_table_pose
+
+        # Camera coordinates are usable here only after zivid_camera_h3.py has
+        # transformed them into the same base frame used by the MuJoCo model.
+        if msg.header.frame_id != "base":
+            return
+
+        p = np.array([
+            msg.pose.position.x,
+            msg.pose.position.y,
+            msg.pose.position.z,
+        ], dtype=float)
+
+        # geometry_msgs stores x,y,z,w; MuJoCo's quaternion routines use
+        # w,x,y,z, so reorder while constructing the array.
+        q = np.array([
+            msg.pose.orientation.w,
+            msg.pose.orientation.x,
+            msg.pose.orientation.y,
+            msg.pose.orientation.z,
+        ], dtype=float)
+
+        # Reject NaN/Inf and a nearly zero quaternion. Normalization prevents
+        # scale errors when converting the quaternion to a rotation matrix.
+        norm = np.linalg.norm(q)
+        if not np.all(np.isfinite(p)) or not np.all(np.isfinite(q)) or norm < 1e-6:
+            return
+
+        with camera_lock:
+            # The monotonic receive time is later used to check camera data
+            # freshness; it is separate from the ROS header timestamp.
+            latest_camera_table_pose = (p, q / norm, time.perf_counter())
+
     def gripper_obj_det_cb(msg: Bool):
         """Store object-detection feedback and its local receive time."""
         nonlocal last_gripper_detection
@@ -354,14 +402,25 @@ def main():
         with gripper_lock:
             last_gripper_status = (tuple(msg.data), time.perf_counter())
 
+    def gripper_distance_cb(msg: Float64):
+        """Store finite measured finger width and its local receive time."""
+        nonlocal last_gripper_distance
+        width = float(msg.data)
+        if not np.isfinite(width) or width < 0.0:
+            return
+        with gripper_lock:
+            last_gripper_distance = (width, time.perf_counter())
+
     # --- ROS publishers and subscribers owned by this script ---
     # The bridge itself already subscribes to joint states and publishes the
     # computed joint torques. These additional endpoints handle the camera
     # target and the gripper command/feedback.
     gripper_pub = bridge.node.create_publisher(Float64, "/hand/finger_distance", 10)
     camera_sub = bridge.node.create_subscription(PoseStamped, args.camera_topic, camera_callback, 1)
+    camera_table_sub = bridge.node.create_subscription(PoseStamped, args.camera_table_topic, camera_table_callback, 1)
     gripper_sub = bridge.node.create_subscription(Bool, "/gripper/object_detected", gripper_obj_det_cb, 10)
     gripper_status_sub = bridge.node.create_subscription(UInt8MultiArray, "/gripper/status", gripper_status_cb, 10)
+    gripper_distance_sub = bridge.node.create_subscription(Float64, "/gripper/current_distance", gripper_distance_cb, 10)
 
     # Configure and confirm the actual driver's force before any VMC torque
     # is buffered. This parameter request does not itself move the fingers.
@@ -496,6 +555,17 @@ def main():
     camera_timeout = 0.8 # Seconds without a new camera pose before it is stale.
     camera_hold_active = False
     closing_timeout = 5.0 # Initial closing timeout; tune from measured gripper motion.
+    gripper_timeout = 0.5 # Allow five nominal 10 Hz feedback periods.
+    grasp_hold_pending = False
+    failure_hold_active = False
+    opening_timeout = 5.0
+    gripper_open_width = 0.140
+    opening_tolerance = 0.005
+    place_arrival_dwell = 0.5
+    placed_cube_position = None
+    t_place_completed = None
+    t_cube_moved = None
+    completed_cycles = 0
 
     def step_iteration():
 
@@ -503,11 +573,13 @@ def main():
 
         The physical robot is the source of q and dq. No mj_step is called:
         mechanism.apply evaluates the three virtual connections at the latest
-        measured state. The returned bool requests one gripper close command
-        from the outer loop after the arrival condition has held long enough.
+        measured state. The returned bool pair requests one close or open
+        command from the outer loop; commands are never sent from this function.
         """
-        nonlocal last_telemetry_log, last_state_time, state_timeout_logged, latest_camera_pose, phase, position_tolerance, connection_tolerance, t_arrival, last_camera_time
-        nonlocal camera_hold_active
+        nonlocal last_telemetry_log, last_state_time, state_timeout_logged, latest_camera_pose, latest_camera_table_pose, phase, position_tolerance, connection_tolerance, t_arrival, last_camera_time
+        nonlocal camera_hold_active, grasp_hold_pending, failure_hold_active
+        nonlocal placed_cube_position, t_place_completed, t_cube_moved, completed_cycles
+        nonlocal t_close_request, t_open_request
         # --- Read the newest ROS measurements ---
         # Consume the most recent JointState, if available. With forward=True,
         # the synchronizer refreshes MuJoCo site poses and velocities using
@@ -545,15 +617,36 @@ def main():
                                  target_top_spring, target_left, target_right)
                 camera_hold_active = True
                 print("[CAMERA] Pose timed out during APPROACH; holding the current end-effector pose")
-        elif camera_pose is not None:
-            # Resume tracking with the new observation. CLOSING and later
-            # phases keep their existing camera-update behavior.
+        elif phase in ("APPROACH", "CLOSING") and camera_pose is not None:
+            # Track the cube only while approaching or closing the fingers.
+            # The transfer and later phases retain their selected place target.
             new_p_top, new_p_left, new_p_right, new_rotation = build_positions(camera_pose, args.link_length)
             update_positions(new_p_top, new_p_left, new_p_right, new_rotation,
                              target_top_spring, target_left, target_right)
             if camera_hold_active:
                 camera_hold_active = False
                 print("[CAMERA] Fresh pose received; tracking the ArUco again")
+        elif phase == "GRASPED":
+            with camera_lock:
+                aruco_table_pose = latest_camera_table_pose
+                latest_camera_table_pose = None
+            if aruco_table_pose is not None:
+                latest_aruco_table_time = aruco_table_pose[2]
+                aruco_table_recent = t_actual - latest_aruco_table_time <= camera_timeout
+
+                if aruco_table_recent and robot_state_recent:
+                    place_top, place_left, place_right, place_rotation = build_positions(aruco_table_pose, args.link_length)
+                    # Shift all three targets upward in the base frame.
+                    place_offset = np.array([0.0, 0.0, 0.035])
+                    place_top += place_offset
+                    place_left += place_offset
+                    place_right += place_offset
+                    update_positions(place_top, place_left, place_right, place_rotation, target_top_spring, target_left, target_right)
+                    phase = "TRANSFER"
+                    t_arrival = None
+                    print("[INFO] TRANSFER phase started; fixed TCP target is 0.035 m above the table marker")
+
+
 
         # --- Compare measured gripper sites with the virtual targets ---
         # The active StaticObjects are the source of truth for both errors.
@@ -593,8 +686,13 @@ def main():
             Rotation.from_matrix(relative_rotation_target).as_rotvec()
             )
 
+            target_mode = (
+                "HOLD_PENDING" if grasp_hold_pending else
+                "HOLD" if camera_hold_active or failure_hold_active else
+                "CUBE" if phase in ("APPROACH", "CLOSING") else "TABLE"
+            )
             print(
-                f"target_mode={'HOLD' if camera_hold_active else 'ARUCO'}; "
+                f"phase={phase}; cycles={completed_cycles}; target_mode={target_mode}; "
                 f"Errore punta xyz: {np.round(error_xyz, 4)} m; "
                 f"modulo: {np.linalg.norm(error_xyz):.4f} m; "
                 f"errore orientazione target xyz: {np.round(orientation_error_xyz_deg, 2)}°; "
@@ -608,6 +706,7 @@ def main():
         # below additionally requires recent robot and camera data.
         within_tolerance = (np.linalg.norm(error_xyz) < position_tolerance and max(connection_errors) < connection_tolerance)
         close_requested = False
+        open_requested = False
 
         # Freshness was evaluated before selecting the targets. An expired
         # camera inhibits closing even when the held-pose error is near zero.
@@ -615,10 +714,9 @@ def main():
             # Start a dwell timer on first arrival. Reset it whenever either
             # error or input freshness leaves the allowed region.
             if within_tolerance and robot_state_recent and camera_data_recent:
-                print("[INFO] Tolerance satisfied. Data are recent")
                 if t_arrival is None:
                     t_arrival = t_actual
-                    print("[INFO] T_arrival set")
+                    print("[ARRIVAL] Pick conditions satisfied; starting 0.5 s timer")
 
                 elif t_actual - t_arrival >= 0.5:
                     # The phase change prevents a second close request on
@@ -642,6 +740,19 @@ def main():
         with gripper_lock:
             detection = last_gripper_detection
             status = last_gripper_status
+            distance = last_gripper_distance
+
+        feedback_time = time.perf_counter()
+        gripper_is_open = False
+        if distance is not None and status is not None:
+            width, t_distance = distance
+            values, t_status = status
+            gripper_is_open = (
+                feedback_time - t_distance <= gripper_timeout
+                and feedback_time - t_status <= gripper_timeout
+                and values[0] == 3 and values[1] == 3 and values[2] == 0
+                and abs(width - gripper_open_width) <= opening_tolerance
+            )
 
         if phase == "CLOSING" and t_close_request is not None:
             # Only feedback received after this close command is accepted.
@@ -657,8 +768,128 @@ def main():
             # A closing attempt that never reports a valid grasp expires.
             if phase == "CLOSING" and t_actual - t_close_request >= closing_timeout:
                 phase = "FAILED"
+                grasp_hold_pending = True
                 print("[INFO] CLOSING phase failed")
 
+        # Monitor the grasp on every iteration, independently of CLOSING.
+        if phase in ("GRASPED", "TRANSFER"):
+            feedback_time = time.perf_counter()
+            grasp_failure_reason = None
+            if detection is None or status is None:
+                grasp_failure_reason = "gripper feedback missing"
+            else:
+                detected, t_detection = detection
+                values, t_status = status
+                g_sta, g_obj, g_flt, g_cu = values
+                if (feedback_time - t_detection > gripper_timeout
+                        or feedback_time - t_status > gripper_timeout):
+                    grasp_failure_reason = "gripper feedback timed out"
+                elif (t_close_request is None
+                        or t_detection <= t_close_request
+                        or t_status <= t_close_request):
+                    grasp_failure_reason = "gripper feedback predates the close request"
+                elif not detected or g_sta != 3 or g_obj != 2 or g_flt != 0:
+                    grasp_failure_reason = (
+                        f"grasp not confirmed: detected={detected}, "
+                        f"gSTA={g_sta}, gOBJ={g_obj}, gFLT={g_flt}"
+                    )
+
+            if grasp_failure_reason is not None:
+                phase = "FAILED"
+                grasp_hold_pending = True
+                t_arrival = None
+                print(f"[GRIPPER] FAILED: {grasp_failure_reason}")
+
+        # Release only after TCP arrival has persisted with a confirmed grasp.
+        # Cube orientation is not part of the place-arrival condition.
+        if phase == "TRANSFER":
+            if np.linalg.norm(error_xyz) < position_tolerance and robot_state_recent:
+                if t_arrival is None:
+                    t_arrival = t_actual
+                    print("[ARRIVAL] Place position reached; starting 0.5 s timer")
+                elif t_actual - t_arrival >= place_arrival_dwell:
+                    phase = "OPENING"
+                    open_requested = True
+                    t_arrival = None
+            else:
+                if t_arrival is not None:
+                    print("[ARRIVAL] Place timer cancelled")
+                t_arrival = None
+
+        elif phase == "OPENING" and t_open_request is not None:
+            # Reject faults immediately, but allow the fingers time to open.
+            opening_fault = (
+                status is not None
+                and status[1] > t_open_request
+                and feedback_time - status[1] <= gripper_timeout
+                and (status[0][0] != 3 or status[0][2] != 0)
+            )
+            if opening_fault:
+                phase = "FAILED"
+                grasp_hold_pending = True
+                print(f"[GRIPPER] OPENING failed: gSTA={status[0][0]}, gFLT={status[0][2]}")
+            elif (gripper_is_open and t_status > t_open_request
+                    and t_distance > t_open_request):
+                completed_cycles += 1
+                # The held release target is the expected cube-marker location.
+                # Keep it even if the open gripper temporarily hides the marker.
+                placed_cube_position = desired_tip_pos.copy()
+                t_place_completed = feedback_time
+                t_cube_moved = None
+                phase = "WAIT_FOR_MOVE"
+                print(
+                    f"[CYCLE] Place {completed_cycles} completed; waiting for cube-marker "
+                    f"displacement >= {args.restart_distance:.3f} m for {args.restart_dwell:.2f} s"
+                )
+            elif feedback_time - t_open_request >= opening_timeout:
+                phase = "FAILED"
+                grasp_hold_pending = True
+                print("[GRIPPER] OPENING failed: no fresh full-opening confirmation within 5 s")
+
+        elif phase == "WAIT_FOR_MOVE":
+            # Only post-place observations can trigger another pick. Use their
+            # receive times so a single image cannot satisfy the restart dwell.
+            if not (robot_state_recent and camera_data_recent and gripper_is_open):
+                t_cube_moved = None
+            elif camera_pose is not None and camera_pose[2] > t_place_completed:
+                cube_displacement = np.linalg.norm(camera_pose[0] - placed_cube_position)
+                if cube_displacement >= args.restart_distance:
+                    if t_cube_moved is None:
+                        t_cube_moved = camera_pose[2]
+                        print("[CYCLE] Cube displacement detected; checking new observations before restarting")
+                    elif camera_pose[2] - t_cube_moved >= args.restart_dwell:
+                        new_p_top, new_p_left, new_p_right, new_rotation = build_positions(
+                            camera_pose, args.link_length
+                        )
+                        update_positions(new_p_top, new_p_left, new_p_right, new_rotation,
+                                         target_top_spring, target_left, target_right)
+                        t_arrival = None
+                        t_close_request = None
+                        t_open_request = None
+                        t_cube_moved = None
+                        t_place_completed = None
+                        placed_cube_position = None
+                        camera_hold_active = False
+                        failure_hold_active = False
+                        grasp_hold_pending = False
+                        phase = "APPROACH"
+                        print(f"[CYCLE] APPROACH started for cycle {completed_cycles + 1}")
+                else:
+                    t_cube_moved = None
+
+        # Capture the hold targets once, using recent robot telemetry only.
+        # If telemetry is stale, the existing torque gate stays at zero until
+        # a new state arrives; then hold that measured pose before applying VMC.
+        if grasp_hold_pending and robot_state_recent:
+            hold_top = data.site_xpos[top_spring_id].copy()
+            hold_left = data.site_xpos[left_grip_id].copy()
+            hold_right = data.site_xpos[right_grip_id].copy()
+            hold_rotation = orientation_from_points(hold_top, hold_left, hold_right)
+            update_positions(hold_top, hold_left, hold_right, hold_rotation,
+                             target_top_spring, target_left, target_right)
+            grasp_hold_pending = False
+            failure_hold_active = True
+            print("[VMC] Holding the measured end-effector pose after cycle failure")
 
         # --- Compute and publish the virtual mechanism torque ---
         # Clear forces from the previous iteration; otherwise they would
@@ -684,8 +915,8 @@ def main():
         # value at --pub-rate; this call does not directly publish a message.
         bridge.publish(data, torques=required_torques) 
 
-        # The caller owns the actual /hand/finger_distance publication.
-        return close_requested
+        # The caller owns the actual /hand/finger_distance publications.
+        return close_requested, open_requested
 
     # --- Real-time paced execution and optional viewer ---
     # step_iteration() is the only consumer of the bridge's latest joint state.
@@ -696,19 +927,26 @@ def main():
     # accepted finger distance. The gripper node performs the actual motion.
     close_msg = Float64()
     close_msg.data = 0.001
+    open_msg = Float64()
+    open_msg.data = gripper_open_width
     # Set only after publishing the close request. Feedback with an earlier
     # receive time must not be mistaken for the result of this grasp attempt.
     t_close_request = None
+    t_open_request = None
     try:
         if args.headless:
             # Run without rendering until the requested wall-clock duration;
             # a nonpositive duration means continue until interrupted.
             while args.duration <= 0 or time.perf_counter() - t_start < args.duration:
-                close_request = step_iteration()
+                close_request, open_request = step_iteration()
                 if close_request:
                     gripper_pub.publish(close_msg)
                     print("[GRIPPER] Close request published: target_width=0.001 m")
                     t_close_request = time.perf_counter()
+                if open_request:
+                    gripper_pub.publish(open_msg)
+                    t_open_request = time.perf_counter()
+                    print(f"[GRIPPER] Open request published: target_width={gripper_open_width:.3f} m")
                 # Sleep only for the remaining fraction of this tick. If the
                 # calculation ran late, restart pacing from the current time
                 # rather than accumulating a growing scheduling backlog.
@@ -723,13 +961,17 @@ def main():
             # not command the robot; ROS telemetry still determines q and dq.
             next_viewer_sync = t_start
             with viewer.launch_passive(model, data) as v:
-                print("[INFO] Passive viewer active. Double-right-click and drag the robot end-effector!")
+                print("[INFO] Passive viewer active; displaying the measured robot configuration")
                 while v.is_running() and (args.duration <= 0 or time.perf_counter() - t_start < args.duration):
-                    close_request = step_iteration()
+                    close_request, open_request = step_iteration()
                     if close_request:
                         gripper_pub.publish(close_msg)
                         print("[GRIPPER] Close request published: target_width=0.001 m")
                         t_close_request = time.perf_counter()
+                    if open_request:
+                        gripper_pub.publish(open_msg)
+                        t_open_request = time.perf_counter()
+                        print(f"[GRIPPER] Open request published: target_width={gripper_open_width:.3f} m")
 
                     now = time.perf_counter()
                     # Rendering is limited to about 30 Hz while the control
