@@ -1,5 +1,11 @@
 # H2 — avvio completo su PC1 e PC2
 
+Il punto di pick attuale è il centro dell'ArUco traslato di **1,5 cm verso
+l'alto lungo lo z della base**: `p_TCP = p_aruco + [0, 0, 0.015]` m.
+La traslazione riguarda tutti e tre i target virtuali e vale per H2 reale,
+simulazione con camera reale e precedente simulazione con marker fittizio.
+Le pose pubblicate dalla camera restano le misure del marker.
+
 Questa guida avvia il controller FR3 sul PC1, il gripper e la camera Zivid
 sull'host del PC2, e `h2_vmc_ros.py` nella shell VMC del PC2. La sequenza è:
 **PC1 pronto → gripper aperto → camera attiva → H2**. Il gripper compie
@@ -682,6 +688,10 @@ ROS e il clock sono stati sostituiti localmente con la posa ricevuta e un
 clock di test. Le verifiche precedenti su target sintetici hanno controllato
 la somma delle coppie, il timeout camera e l'aggiornamento durante la
 chiusura. Il nuovo comportamento va riprovato con camera e viewer sul PC2.
+
+I valori numerici di questa verifica storica sono stati ottenuti con offset
+di pick nullo. Precedono l'aggiunta dell'offset di 1,5 cm e non costituiscono
+una verifica hardware della nuova quota di pick.
 
 Verificato localmente anche il nuovo `HOLD`, con dinamica MuJoCo e ingresso
 camera/clock sostituiti: acquisizione unica dei tre site dopo il timeout,

@@ -93,7 +93,7 @@ def add_camera_marker(spec: mujoco.MjSpec) -> None:
         )
 
 
-def build_positions(camera_pose, link_length: float):
+def build_positions(camera_pose, link_length: float, height_offset: float = 0.015):
     """Convert the sampled marker pose to H2's three world-frame targets."""
     p_marker, q_marker = camera_pose  # Quaternion order: w, x, y, z.
     rotation_flat = np.empty(9)
@@ -102,8 +102,8 @@ def build_positions(camera_pose, link_length: float):
     x_marker = R_base_marker[:, 0]
     z_marker = R_base_marker[:, 2]
 
-    # H2 uses h=0: the marker centre is the desired TCP position.
-    p_target = p_marker
+    # Raise the pick TCP 1.5 cm along world/base +z, not the marker's z axis.
+    p_target = p_marker + np.array([0.0, 0.0, float(height_offset)])
     p_left = p_target + FINGER_OFFSET * x_marker
     p_right = p_target - FINGER_OFFSET * x_marker
     p_top = p_target + link_length * z_marker

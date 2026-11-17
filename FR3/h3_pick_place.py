@@ -82,13 +82,15 @@ def build_ee_link_model(
     ee_spec.add_site(name="gripper_left_finger", pos=[tcp_pos[0], tcp_pos[1] - 0.3, tcp_pos[2]], size=[0.012, 0.0, 0.0], rgba=[1.0, 0.0, 0.0, 0.8], group=0)
     ee_spec.add_site(name="gripper_right_finger", pos=[tcp_pos[0], tcp_pos[1] + 0.3, tcp_pos[2]], size=[0.012, 0.0, 0.0], rgba=[1.0, 0.0, 0.0, 0.8], group=0)
 
-def build_positions(camera_pose, link_length):
+def build_positions(camera_pose, link_length, height_offset=0.015):
     """Build the three target points from one measured base-frame marker pose.
 
     camera_pose contains (position, quaternion, receive_time). The position is
     in metres in the FR3 base frame; the quaternion uses MuJoCo order wxyz.
     The returned points are also in base/world coordinates, so they can be
     compared directly with MuJoCo's site_xpos values.
+    height_offset raises the TCP and all three anchors along base +z. The
+    default is 1.5 cm for picking; H3 passes zero for its separate place offset.
     """
     L = float(link_length)
     p_marker, q_marker, received_at = camera_pose
@@ -101,11 +103,11 @@ def build_positions(camera_pose, link_length):
 
     x_aruco_in_base = R_base_aruco[:, 0]
     z_aruco = R_base_aruco[:, 2]
-    # With h=0, the desired TCP coincides with the marker origin. The side
-    # targets lie along marker x. The upper robot site is at -L along TCP z,
+    # Raise the pick TCP along base +z, independently of the marker orientation.
+    # Side targets lie along marker x. The upper robot site is at -L along TCP z,
     # so matching TCP +z to marker +z puts its target along marker -z.
-    h = 0.0
-    p_target = p_marker - h * z_aruco
+    h = float(height_offset)
+    p_target = p_marker + np.array([0.0, 0.0, h])
     p_left = p_target + 0.30 * x_aruco_in_base
     p_right = p_target - 0.30 * x_aruco_in_base
     # For the measured lab marker (+z downward), this point is above the marker.
@@ -635,7 +637,9 @@ def main():
                 aruco_table_recent = t_actual - latest_aruco_table_time <= camera_timeout
 
                 if aruco_table_recent and robot_state_recent:
-                    place_top, place_left, place_right, place_rotation = build_positions(aruco_table_pose, args.link_length)
+                    place_top, place_left, place_right, place_rotation = build_positions(
+                        aruco_table_pose, args.link_length, height_offset=0.0
+                    )
                     # Shift all three targets upward in the base frame.
                     place_offset = np.array([0.0, 0.0, 0.035])
                     place_top += place_offset

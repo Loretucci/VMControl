@@ -13,6 +13,10 @@ l'ordine **PC1 pronto → gripper aperto → camera H3 attiva → H3 reale**.
 I comandi avviano direttamente i file H3. I launch
 `h2_vmc.launch.py` e `zivid_camera_h2.launch.py` continuano ad avviare H2.
 
+Il TCP di **pick** è 1,5 cm sopra il centro del marker del cubo, lungo lo z
+della base. Il TCP di **place** resta 3,5 cm sopra il marker del tavolo:
+i due offset sono applicati separatamente e non si sommano.
+
 ## 1. Ambienti, percorsi e marker
 
 | Dove | Processo | Python |
@@ -409,7 +413,8 @@ Il ciclo è:
 
 `APPROACH → CLOSING → GRASPED → TRANSFER → OPENING → WAIT_FOR_MOVE → APPROACH`
 
-- **APPROACH:** segue la posa del cubo. TCP e tre collegamenti devono restare
+- **APPROACH:** segue il cubo con il TCP desiderato 1,5 cm sopra il marker.
+  TCP e tre collegamenti devono restare
   entro 1 cm per 0,5 s, con dati recenti, prima della richiesta di chiusura.
 - **CLOSING:** invia una sola richiesta di chiusura e attende la conferma.
 - **GRASPED:** attende una posa recente del tavolo e costruisce il riferimento.
@@ -429,6 +434,8 @@ piano dipende anche dalle dimensioni e dalla posizione del cubo nella presa.
 
 | Impostazione | Valore attuale |
 |---|---|
+| Offset TCP di pick | `+0.015` m lungo lo z della base |
+| Offset TCP di place | `+0.035` m lungo lo z della base, separato dal pick |
 | `--restart-distance` | `0.05` m, distanza tridimensionale |
 | `--restart-dwell` | `0.5` s, su nuove osservazioni camera |
 | `--duration` | `0`, continua fino a interruzione |
