@@ -321,7 +321,9 @@ ros2 topic info /robot1/torque_subscriber_controller/external_torques --verbose
 `pgrep` non stampa nulla quando non c'è già un H2. `topic info` deve mostrare
 il tipo `std_msgs/msg/Float64MultiArray` e un subscriber del controller. Se
 non è così, controllare il nome del topic sul PC1 prima del launch. Il comando
-seguente usa **il controller reale** e i valori richiesti per la prova:
+seguente usa **il controller reale** e riporta esplicitamente i valori
+attuali del parser di `h2_vmc_ros.py` per le due molle, il damper e la
+geometria. I guadagni della simulazione sono riportati nella sezione 11.
 
 ```bash
 ros2 launch /workspace/VMControl/FR3/h2_vmc.launch.py \
@@ -331,9 +333,15 @@ ros2 launch /workspace/VMControl/FR3/h2_vmc.launch.py \
   camera_topic:=/vision/aruco_pose \
   gripper_force:=30 \
   torque_pub_topic:=/robot1/torque_subscriber_controller/external_torques \
-  stiffness:=600 \
-  damping:=30 \
-  max_force:=10 \
+  pub_rate:=1000 \
+  link_length:=0.8 \
+  stiffness:=2000 \
+  stiffness2:=20 \
+  damping:=50 \
+  max_force:=2 \
+  max_force2:=8 \
+  timestep:=0.001 \
+  state_timeout:=0.2 \
   headless:=false \
   target_radius:=0.015 \
   duration:=0
@@ -341,10 +349,18 @@ ros2 launch /workspace/VMControl/FR3/h2_vmc.launch.py \
 
 `headless:=false` richiede il viewer X11; `duration:=0` mantiene H2 attivo
 finché non viene fermato. H2 attende una prima posa camera valida e un primo
-`JointState`, poi crea i tre collegamenti virtuali. A ogni aggiornamento usa
-lo stato reale misurato, calcola le coppie nel modello virtuale e le pubblica
+`JointState`, poi crea due serie di tre collegamenti virtuali in parallelo.
+A ogni aggiornamento usa lo stato reale misurato, calcola le coppie nel
+modello virtuale e le pubblica
 verso il controller. Non chiama `mj_step` per far evolvere un secondo robot
 dinamico.
+
+Per ciascuno dei tre punti, la prima serie usa `stiffness`, `max_force` e
+`damping`; la seconda aggiunge una molla con `stiffness2` e `max_force2`,
+senza un secondo damper. Il launch trasmette entrambi i gruppi al parser:
+per esempio `stiffness2:=40` diventa `--stiffness2 40`. I contributi delle due
+serie si sommano. La forza del gripper (`gripper_force`) è indipendente da
+questi parametri delle molle virtuali.
 
 La forza del gripper si sceglie dal parser H2 con `--gripper-force 30`, o dal
 launch con `gripper_force:=30`. E un intero nella scala del registro Robotiq
@@ -391,10 +407,11 @@ di pubblicazione di zero coppia VMC aggiuntiva.
 
 Questa configurazione può muovere il **robot reale** e può chiedere al nodo
 gripper una chiusura su `/hand/finger_distance`: la prova non è ancora stata
-validata come funzionante. `max_force=10` limita ogni componente delle forze
-elastiche virtuali, non la coppia totale ai giunti né il contributo dei
-damper. Il timeout Python invia zero coppia VMC aggiuntiva se lo stato diventa
-vecchio, ma non sostituisce l'arresto del sistema robotico.
+validata come funzionante. `max_force=2` e `max_force2=8` limitano ciascuna
+componente della rispettiva molla a ogni collegamento, non la coppia totale
+ai giunti né il contributo dei damper. Il timeout Python invia zero coppia
+VMC aggiuntiva se lo stato diventa vecchio, ma non sostituisce l'arresto del
+sistema robotico.
 
 ## 7. Verificare la comunicazione durante la prova
 
@@ -429,6 +446,11 @@ Il launch espone i parametri del parser di `h2_vmc_ros.py` usando
 invocazione con `start_h2:=false`; la camera usa il suo launch separato. La
 tabella riporta **i valori del comando reale della sezione 6**, non i default
 del file launch: usare il comando completo per riprodurre questa configurazione.
+I default delle due molle, del damper, di `link_length`, `target_radius` e
+`gripper_force` sono ora allineati al parser reale. Restano da specificare i
+topic del robot: il default `torque_pub_topic` del launch è ancora
+`/vmc/h2_dry_run_torques`; il comando della sezione 6 lo sostituisce con
+quello del controller reale.
 
 | Argomento | Valore nella sezione 6 | Significato |
 |---|---|---|
@@ -439,10 +461,12 @@ del file launch: usare il comando completo per riprodurre questa configurazione.
 | `camera_topic` | `/vision/aruco_pose` | Posa target della Zivid |
 | `gripper_force` | `30` | Registro di forza Robotiq rFR, intero 1-255, non Newton |
 | `pub_rate` | `1000.0` Hz | Frequenza ROS richiesta dal launch |
-| `link_length` | `0.4` m | Distanza TCP–site superiore |
-| `stiffness` | `600` N/m | Rigidezza per collegamento |
-| `damping` | `30` Ns/m | Smorzamento per collegamento |
-| `max_force` | `10` N | Saturazione per componente della molla |
+| `link_length` | `0.8` m | Distanza TCP–site superiore |
+| `stiffness` | `2000` N/m | Rigidezza della prima molla per collegamento |
+| `stiffness2` | `20` N/m | Rigidezza della seconda molla in parallelo |
+| `damping` | `50` Ns/m | Smorzamento per collegamento nella prima serie |
+| `max_force` | `2` N | Saturazione per componente della prima molla |
+| `max_force2` | `8` N | Saturazione per componente della seconda molla |
 | `timestep` | `0.001` s | Intervallo di pacing del loop Python |
 | `state_timeout` | `0.2` s | Soglia di stato robot scaduto |
 | `duration` | `0` | Continuo fino a stop |
@@ -451,6 +475,12 @@ del file launch: usare il comando completo per riprodurre questa configurazione.
 
 Il parser legge i valori all'avvio: dopo una modifica occorre fermare e
 rilanciare H2.
+
+Per controllare gli argomenti disponibili senza avviare H2, dalla shell VMC:
+
+```bash
+ros2 launch /workspace/VMControl/FR3/h2_vmc.launch.py --show-args
+```
 
 Con il viewer attivo, H2 mostra i tre riferimenti `StaticObject` come sfere:
 ciano per il punto superiore, verde per il sinistro e rosa per il destro.
