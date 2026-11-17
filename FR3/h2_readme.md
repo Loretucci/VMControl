@@ -1,7 +1,7 @@
 # H2 — avvio completo su PC1 e PC2
 
-Il punto di pick attuale è il centro dell'ArUco traslato di **1,5 cm verso
-l'alto lungo lo z della base**: `p_TCP = p_aruco + [0, 0, 0.015]` m.
+Il punto di pick attuale è il centro dell'ArUco traslato di **3 cm verso
+l'alto lungo lo z della base**: `p_TCP = p_aruco + [0, 0, 0.03]` m.
 La traslazione riguarda tutti e tre i target virtuali e vale per H2 reale,
 simulazione con camera reale e precedente simulazione con marker fittizio.
 Le pose pubblicate dalla camera restano le misure del marker.

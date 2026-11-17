@@ -93,7 +93,7 @@ def add_camera_marker(spec: mujoco.MjSpec) -> None:
         )
 
 
-def build_positions(camera_pose, link_length: float, height_offset: float = 0.015, yaw_sign: int = 1):
+def build_positions(camera_pose, link_length: float, height_offset: float = 0.03, yaw_sign: int = 1):
     """Build H2 targets; yaw_sign=-1 selects the equivalent 180-degree grasp."""
     p_marker, q_marker = camera_pose  # Quaternion order: w, x, y, z.
     rotation_flat = np.empty(9)
@@ -104,7 +104,7 @@ def build_positions(camera_pose, link_length: float, height_offset: float = 0.01
     x_marker = R_base_marker[:, 0]
     z_marker = R_base_marker[:, 2]
 
-    # Raise the pick TCP 1.5 cm along world/base +z, not the marker's z axis.
+    # Raise the pick TCP 3 cm along world/base +z, not the marker's z axis.
     p_target = p_marker + np.array([0.0, 0.0, float(height_offset)])
     p_left = p_target + FINGER_OFFSET * x_marker
     p_right = p_target - FINGER_OFFSET * x_marker

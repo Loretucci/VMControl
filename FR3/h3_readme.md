@@ -13,8 +13,8 @@ l'ordine **PC1 pronto → gripper aperto → camera H3 attiva → H3 reale**.
 I comandi avviano direttamente i file H3. I launch
 `h2_vmc.launch.py` e `zivid_camera_h2.launch.py` continuano ad avviare H2.
 
-Il TCP di **pick** è 1,5 cm sopra il centro del marker del cubo, lungo lo z
-della base. Il TCP di **place** resta 3,5 cm sopra il marker del tavolo:
+Il TCP di **pick** è 3 cm sopra il centro del marker del cubo, lungo lo z
+della base. Il TCP di **place** è 7 cm sopra il marker del tavolo:
 i due offset sono applicati separatamente e non si sommano.
 
 ## 1. Ambienti, percorsi e marker
@@ -428,13 +428,13 @@ gradi rispetto al rispettivo marker. Questa selezione modifica i target
 delle molle e il riferimento diagnostico, senza allargare le tolleranze di
 arrivo. La stessa logica e presente in `h3_simulations.py`.
 
-- **APPROACH:** segue il cubo con il TCP desiderato 1,5 cm sopra il marker.
+- **APPROACH:** segue il cubo con il TCP desiderato 3 cm sopra il marker.
   TCP e tre collegamenti devono restare
   entro 1 cm per 0,5 s, con dati recenti, prima della richiesta di chiusura.
 - **CLOSING:** invia una sola richiesta di chiusura e attende la conferma.
 - **GRASPED:** attende una posa recente del tavolo e costruisce il riferimento.
 - **TRANSFER:** usa un'unica destinazione fissa: centro del marker tavolo
-  più `0.035 m` lungo lo z della base. Controlla continuamente la presa.
+  più `0.07 m` lungo lo z della base. Controlla continuamente la presa.
 - **OPENING:** richiede una sola apertura quando il TCP resta entro 1 cm
   dalla destinazione per 0,5 s; attende il feedback di apertura.
 - **WAIT_FOR_MOVE:** mantiene il riferimento e attende uno spostamento del
@@ -444,13 +444,13 @@ Il criterio di arrivo al place usa la posizione TCP. L'orientazione finale
 del cubo non è una condizione di riuscita; i tre punti virtuali continuano
 a dare al gripper il riferimento geometrico costruito dalla posa del tavolo.
 
-La quota di 3,5 cm riguarda il **TCP**. La distanza del fondo del cubo dal
+La quota di 7 cm riguarda il **TCP**. La distanza del fondo del cubo dal
 piano dipende anche dalle dimensioni e dalla posizione del cubo nella presa.
 
 | Impostazione | Valore attuale |
 |---|---|
-| Offset TCP di pick | `+0.015` m lungo lo z della base |
-| Offset TCP di place | `+0.035` m lungo lo z della base, separato dal pick |
+| Offset TCP di pick | `+0.03` m lungo lo z della base |
+| Offset TCP di place | `+0.07` m lungo lo z della base, separato dal pick |
 | `--restart-distance` | `0.05` m, distanza tridimensionale |
 | `--restart-dwell` | `0.5` s, su nuove osservazioni camera |
 | `--duration` | `0`, continua fino a interruzione |

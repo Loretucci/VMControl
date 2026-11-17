@@ -37,7 +37,7 @@ from mujoco_vmc import (
 )
 
 
-def draw_sphere(scene, pos, radius=0.015, rgba=None):
+def draw_sphere(scene, pos, radius=0.03, rgba=None):
     """Draw a viewer-only target without adding physical model geometry."""
     if scene.ngeom >= scene.maxgeom:
         return False
@@ -78,7 +78,7 @@ def build_ee_link_model(
     ee_spec.add_site(name="gripper_left_finger", pos=[tcp_pos[0], tcp_pos[1] - 0.3, tcp_pos[2]], size=[0.012, 0.0, 0.0], rgba=[1.0, 0.0, 0.0, 0.8], group=0)
     ee_spec.add_site(name="gripper_right_finger", pos=[tcp_pos[0], tcp_pos[1] + 0.3, tcp_pos[2]], size=[0.012, 0.0, 0.0], rgba=[1.0, 0.0, 0.0, 0.8], group=0)
 
-def build_positions(camera_pose, link_length, height_offset=0.015, yaw_sign=1):
+def build_positions(camera_pose, link_length, height_offset=0.03, yaw_sign=1):
     """Build the three target points from one measured base-frame marker pose.
 
     camera_pose contains (position, quaternion, receive_time). The position is
@@ -86,7 +86,7 @@ def build_positions(camera_pose, link_length, height_offset=0.015, yaw_sign=1):
     The returned points are also in base/world coordinates, so they can be
     compared directly with MuJoCo's site_xpos values.
     height_offset raises the TCP and all three anchors along base +z. The
-    default is 1.5 cm for picking; H3 passes zero for its separate place offset.
+    default is 3 cm for picking; H3 passes zero for its separate place offset.
     yaw_sign=-1 selects the equivalent 180-degree grasp about marker z.
     """
     L = float(link_length)
